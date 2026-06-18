@@ -71,6 +71,24 @@ export interface PaginatedOutputResult {
 }
 
 /**
+ * Encode a command string for PowerShell's -EncodedCommand parameter.
+ *
+ * PowerShell's -Command parses the command through its tokenizer before
+ * execution: variables ($_, $env:*, $PROFILE), back-ticks, and embedded quotes
+ * all go through interpretation, which corrupts commands carrying any of those
+ * characters before they ever reach the script body. -EncodedCommand bypasses
+ * the tokenizer entirely: PS decodes the base64 UTF-16LE blob and runs the
+ * literal string. Fixes upstream issue #350 (and the broken reproduction in
+ * E:\MCP\DesktopCommanderMCP\bug.md, where Where-Object {$_.Name ...} was
+ * stripped to {.Name ...}).
+ *
+ * Safe for any command: ASCII, CJK, mixed line endings, embedded quotes.
+ */
+function encodePowerShellCommand(command: string): string {
+  return Buffer.from(command, 'utf16le').toString('base64');
+}
+
+/**
  * Configuration for spawning a shell with appropriate flags
  */
 interface ShellSpawnConfig {
@@ -99,20 +117,24 @@ function getShellSpawnArgs(shellPath: string, command: string): ShellSpawnConfig
   }
   
   // PowerShell Core (cross-platform, supports -Login)
+  // Use -EncodedCommand instead of -Command to bypass PS's command-line
+  // tokenizer; otherwise variables ($_, $env:*), back-ticks, and embedded
+  // quotes get mangled before the script body runs (upstream #350, bug.md).
+  // -Login still applies — it controls profile loading, not the command source.
   if (shellName === 'pwsh' || shellName === 'pwsh.exe') {
-    return { 
-      executable: shellPath, 
-      args: ['-Login', '-Command', command],
-      useShellOption: false 
+    return {
+      executable: shellPath,
+      args: ['-Login', '-EncodedCommand', encodePowerShellCommand(command)],
+      useShellOption: false
     };
   }
-  
-  // Windows PowerShell 5.1 (no login flag support)
+
+  // Windows PowerShell 5.1 (no -Login support)
   if (shellName === 'powershell' || shellName === 'powershell.exe') {
-    return { 
-      executable: shellPath, 
-      args: ['-Command', command],
-      useShellOption: false 
+    return {
+      executable: shellPath,
+      args: ['-EncodedCommand', encodePowerShellCommand(command)],
+      useShellOption: false
     };
   }
   

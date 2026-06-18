@@ -13,6 +13,9 @@ export interface ServerConfig {
   telemetryEnabled?: boolean; // New field for telemetry control
   fileWriteLineLimit?: number; // Line limit for file write operations
   fileReadLineLimit?: number; // Default line limit for file read operations (changed from character-based)
+  writeFileOverwriteProtection?: boolean; // When true (default), write_file mode='rewrite' refuses to silently overwrite existing files
+  responseMaxChars?: number;   // Tool-response character cap (Kiro IDE doesn't auto-truncate). Default 50000.
+  initialOutputMaxChars?: number; // start_process initial-output cap. Default 16000.
   clientId?: string; // Unique client identifier for analytics
   currentClient?: ClientInfo; // Current connected client information
   [key: string]: any; // Allow for arbitrary configuration keys (including abTest_* keys)
@@ -169,6 +172,9 @@ class ConfigManager {
       telemetryEnabled: true, // Default to opt-out approach (telemetry on by default)
       fileWriteLineLimit: 50,  // Default line limit for file write operations (changed from 100)
       fileReadLineLimit: 1000,  // Default line limit for file read operations (changed from character-based)
+      writeFileOverwriteProtection: true, // Block silent full-file overwrites of existing files (caller must pass allowOverwrite=true)
+      responseMaxChars: 50000,   // ~50KB cap for tool responses; prevents Kiro IDE context overflow
+      initialOutputMaxChars: 16000, // ~16KB cap for start_process initial output; full output via read_process_output
       pendingWelcomeOnboarding: true  // New install flag - triggers A/B test for welcome page
     };
   }

@@ -16,6 +16,26 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const mcpRoot = path.resolve(__dirname, '..', '..');
 
+/**
+ * Char-level cap for tool responses.
+ *
+ * Hosts that don't auto-truncate (Kiro IDE notably) can be locked up by a
+ * single 100KB+ response — listing 10k files in a process buffer, dumping a
+ * deeply recursive ls, etc. We keep the tail (most recent output is usually
+ * what matters for state detection / prompt recognition) and prepend a hint.
+ *
+ * The per-session 50MB ring buffer (MAX_BUFFERED_OUTPUT_CHARS) is unaffected;
+ * full output is always available via paginated read_process_output.
+ */
+function applyResponseCharCap(text: string, maxChars: number, hint: string): string {
+  if (text.length <= maxChars) return text;
+  const tail = text.slice(text.length - maxChars);
+  // Snap to next newline so the truncation marker isn't mid-line.
+  const firstNl = tail.indexOf('\n');
+  const cleanTail = firstNl > 0 && firstNl < maxChars * 0.05 ? tail.slice(firstNl + 1) : tail;
+  return `[...truncated ${text.length - cleanTail.length} chars; ${hint}]\n${cleanTail}`;
+}
+
 // Track virtual Node sessions (PIDs that are actually Node fallback sessions)
 const virtualNodeSessions = new Map<number, { timeout_ms: number }>();
 let virtualPidCounter = -1000; // Use negative PIDs for virtual sessions
@@ -200,10 +220,21 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
     timingMessage = formatTimingInfo(result.timingInfo);
   }
 
+  // Char-level cap on initial output. The per-session 50MB ring buffer keeps
+  // the full stream — full output is reachable via read_process_output.
+  // Without this cap, `ls -laR /` or similar floods the host context window.
+  const config = await configManager.getConfig();
+  const initialCap = config.initialOutputMaxChars ?? 16000;
+  const cappedOutput = applyResponseCharCap(
+    result.output,
+    initialCap,
+    `use read_process_output(pid=${result.pid}, offset=0|negative) to read more`
+  );
+
   return {
     content: [{
       type: "text",
-      text: `Process started with PID ${result.pid} (shell: ${shellUsed})\nInitial output:\n${result.output}${statusMessage}${timingMessage}`
+      text: `Process started with PID ${result.pid} (shell: ${shellUsed})\nInitial output:\n${cappedOutput}${statusMessage}${timingMessage}`
     }],
   };
 }
@@ -373,10 +404,20 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
 
   const responseText = output || '(No output in requested range)';
 
+  // Char-level cap so a long-line process (every line > 1KB) can't blow up
+  // the host context. Line-level pagination above bounds line count, but
+  // doesn't bound chars-per-line; this is the second guard.
+  const responseMaxChars = config.responseMaxChars ?? 50000;
+  const cappedResponse = applyResponseCharCap(
+    responseText,
+    responseMaxChars,
+    `request a smaller length or a different offset for the rest`
+  );
+
   return {
     content: [{
       type: "text",
-      text: `${statusMessage}\n\n${responseText}${processStateMessage}${timingMessage}`
+      text: `${statusMessage}\n\n${cappedResponse}${processStateMessage}${timingMessage}`
     }],
   };
 }
@@ -573,6 +614,16 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
       cleanOutput = truncatedLines.join('\n');
       const remainingLines = outputLines.length - maxOutputLines;
       truncationMessage = `\n\n⚠️ Output truncated: showing ${maxOutputLines} of ${outputLines.length} lines (${remainingLines} hidden). Use read_process_output with offset/length for full output.`;
+    }
+
+    // Char-level cap (second guard against long-line floods).
+    const responseMaxChars = config.responseMaxChars ?? 50000;
+    if (cleanOutput.length > responseMaxChars) {
+      cleanOutput = applyResponseCharCap(
+        cleanOutput,
+        responseMaxChars,
+        `use read_process_output(pid=${pid}) for the rest`
+      );
     }
     
     // Determine final state

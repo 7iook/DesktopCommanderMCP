@@ -38,6 +38,21 @@ export const CONFIG_FIELD_DEFINITIONS = {
     description: 'Maximum number of lines that can be written in one edit operation. This helps prevent accidental oversized writes and keeps file changes predictable.',
     valueType: 'number',
   },
+  writeFileOverwriteProtection: {
+    label: 'Write-File Overwrite Protection',
+    description: 'When on (default), write_file with mode="rewrite" refuses to silently overwrite existing files; the caller must pass allowOverwrite=true or use edit_block / mode="append" instead. Turn off to restore the legacy unconditional-rewrite behavior.',
+    valueType: 'boolean',
+  },
+  responseMaxChars: {
+    label: 'Response Character Cap',
+    description: 'Maximum characters returned in a single tool response. Prevents large directory listings or long process output from overflowing the host context window. Output beyond this cap is truncated with a continuation hint. Default 50000.',
+    valueType: 'number',
+  },
+  initialOutputMaxChars: {
+    label: 'Initial Process-Output Cap',
+    description: 'Maximum characters from the initial output buffer included in start_process response. Per-session ring buffer keeps the full output (50MB cap), readable via read_process_output. Default 16000.',
+    valueType: 'number',
+  },
 } as const satisfies Record<string, ConfigFieldDefinition>;
 
 export type ConfigFieldKey = keyof typeof CONFIG_FIELD_DEFINITIONS;

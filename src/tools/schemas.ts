@@ -63,6 +63,11 @@ export const WriteFileArgsSchema = z.object({
   path: z.string(),
   content: z.string(),
   mode: z.enum(['rewrite', 'append']).default('rewrite'),
+  // Overwrite protection: when mode='rewrite' and the target file already
+  // exists, the handler refuses unless allowOverwrite is true. Prevents
+  // silent full-file overwrites by AI clients that ignore prompt-level rules.
+  // Disable globally via config: writeFileOverwriteProtection=false.
+  allowOverwrite: z.boolean().optional().default(false),
 });
 
 // PDF modification schemas - exported for reuse
@@ -111,6 +116,11 @@ export const CreateDirectoryArgsSchema = z.object({
 export const ListDirectoryArgsSchema = z.object({
   path: z.string(),
   depth: z.number().optional().default(2),
+  // Pagination for large directories. Without this, listing a folder with
+  // thousands of entries blows up host context windows (Kiro IDE notably
+  // doesn't auto-truncate). Defaults match read_file pagination semantics.
+  offset: z.number().optional().default(0),
+  limit: z.number().optional(),  // Default applied at handler from config.responseMaxEntries
 });
 
 export const MoveFileArgsSchema = z.object({

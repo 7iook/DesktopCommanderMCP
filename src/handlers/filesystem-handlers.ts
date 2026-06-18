@@ -30,6 +30,7 @@ import {
 } from '../tools/schemas.js';
 import path from 'path';
 import os from 'os';
+import fs from 'fs/promises';
 import { resolvePreviewFileType } from '../ui/file-preview/shared/preview-file-types.js';
 
 /**
@@ -290,6 +291,36 @@ export async function handleWriteFile(args: unknown): Promise<ServerResult> {
         const config = await configManager.getConfig();
         const MAX_LINES = config.fileWriteLineLimit ?? 50; // Default to 50 if not set
 
+        // Overwrite protection: when mode='rewrite' and target file already
+        // exists, refuse unless allowOverwrite=true. Prevents silent full-file
+        // overwrites by AI clients that ignore prompt-level rules ("use
+        // edit_block / append"). Tightens user-rule §3 from policy to code.
+        // Set writeFileOverwriteProtection=false to restore legacy behavior.
+        const protectionEnabled = config.writeFileOverwriteProtection !== false;
+        if (parsed.mode === 'rewrite' && !parsed.allowOverwrite && protectionEnabled) {
+            const resolvedCheckPath = resolveAbsolutePath(parsed.path);
+            try {
+                const stat = await fs.stat(resolvedCheckPath);
+                if (stat.isFile()) {
+                    return createErrorResponse(
+`⚠️ File already exists: ${parsed.path}
+write_file with mode='rewrite' would OVERWRITE the entire file (${stat.size} bytes).
+
+Choose one:
+  • Surgical edit (recommended) → use edit_block with old_string + new_string
+  • Append at end → call write_file again with mode:'append'
+  • Intentional full overwrite → set allowOverwrite:true and retry
+
+Disable this guard globally:
+  set_config_value("writeFileOverwriteProtection", false)`
+                    );
+                }
+            } catch (err: any) {
+                if (err && err.code !== 'ENOENT') throw err;
+                // ENOENT: file doesn't exist; rewrite is safe (creating new file).
+            }
+        }
+
         // Strictly enforce line count limit
         const lines = parsed.content.split('\n');
         const lineCount = lines.length;
@@ -344,19 +375,61 @@ export async function handleCreateDirectory(args: unknown): Promise<ServerResult
 
 /**
  * Handle list_directory command
+ *
+ * Pagination + char cap defense against host context overflow. Kiro IDE doesn't
+ * auto-truncate tool responses, so listing a folder with thousands of entries
+ * blows up the conversation window. Two layers of protection:
+ *   1. Entry-level pagination (offset/limit) — top-level entries cap.
+ *   2. Char-level cap (responseMaxChars) — last-resort tail trim, snaps to
+ *      a clean newline boundary so partial entries aren't shown.
  */
 export async function handleListDirectory(args: unknown): Promise<ServerResult> {
     try {
         const startTime = Date.now();
         const parsed = ListDirectoryArgsSchema.parse(args);
-        const entries = await listDirectory(parsed.path, parsed.depth);
+        const config = await configManager.getConfig();
+        const responseMaxChars = config.responseMaxChars ?? 50000;
+        const defaultLimit = config.fileReadLineLimit ?? 1000;
+        const limit = parsed.limit ?? defaultLimit;
+        const offset = parsed.offset ?? 0;
+
+        const allEntries = await listDirectory(parsed.path, parsed.depth);
+        const total = allEntries.length;
+        const sliced = allEntries.slice(offset, offset + limit);
         const duration = Date.now() - startTime;
 
-        const resultText = entries.join('\n');
+        let resultText = sliced.join('\n');
+        let charTruncated = false;
+        if (resultText.length > responseMaxChars) {
+            // Char-level cap: trim tail, snap to last newline so we don't cut
+            // a path mid-name. Threshold of 50% prevents pathological cases
+            // where a single huge line forces dropping everything.
+            let trimmed = resultText.slice(0, responseMaxChars);
+            const lastNl = trimmed.lastIndexOf('\n');
+            if (lastNl > responseMaxChars * 0.5) trimmed = trimmed.slice(0, lastNl);
+            resultText = trimmed;
+            charTruncated = true;
+        }
+
+        const shownEnd = offset + sliced.length;
+        const remainingEntries = Math.max(0, total - shownEnd);
+        let hintLines: string[] = [];
+        if (sliced.length === 0 && total > 0) {
+            hintLines.push(`[Empty page: offset=${offset} is beyond ${total} total entries. Try offset=0.]`);
+        } else if (charTruncated || remainingEntries > 0) {
+            const parts: string[] = [];
+            parts.push(`showing entries ${offset}..${shownEnd - 1} of ${total} total`);
+            if (charTruncated) parts.push(`output capped at ${responseMaxChars} chars`);
+            if (remainingEntries > 0) parts.push(`use offset=${shownEnd} limit=${limit} to fetch more`);
+            hintLines.push(`\n[Listing truncated: ${parts.join('; ')}]`);
+        } else if (offset > 0) {
+            hintLines.push(`\n[Showing entries ${offset}..${shownEnd - 1} of ${total} total]`);
+        }
+        const finalText = resultText + (hintLines.length ? '\n' + hintLines.join('\n') : '');
         const resolvedPath = resolveAbsolutePath(parsed.path);
 
         return {
-            content: [{ type: "text", text: resultText }],
+            content: [{ type: "text", text: finalText }],
             structuredContent: {
                 fileName: path.basename(resolvedPath),
                 filePath: resolvedPath,
@@ -365,7 +438,7 @@ export async function handleListDirectory(args: unknown): Promise<ServerResult> 
                 // Carry the listing in structuredContent too. Chat reads the text
                 // content array, but structuredContent-only consumers (e.g. Cowork)
                 // render from here and would otherwise show an empty directory.
-                content: resultText,
+                content: finalText,
             },
         };
     } catch (error) {
