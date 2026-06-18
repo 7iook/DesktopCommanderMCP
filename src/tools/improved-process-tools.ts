@@ -17,6 +17,42 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const mcpRoot = path.resolve(__dirname, '..', '..');
 
+/**
+ * Resolve a cwd hint to an absolute, existing directory path.
+ *
+ * Handles:
+ *   - undefined / empty → returns undefined (caller falls through legacy behavior)
+ *   - leading ~ / ~/ → expanded to os.homedir()
+ *   - relative paths → resolved against process.cwd() (server's own cwd, which
+ *     for mcphub-spawned servers is mcphub's cwd — that's the whole reason
+ *     this parameter exists, so callers should normally pass absolute)
+ *   - non-existent path → throws Error with ERR_CWD_NOT_FOUND prefix
+ *   - exists but not a directory → throws Error with ERR_CWD_NOT_DIR prefix
+ *
+ * Returns the resolved absolute path on success.
+ */
+async function resolveProcessCwd(rawCwd: string | undefined): Promise<string | undefined> {
+  if (!rawCwd) return undefined;
+  let expanded = rawCwd;
+  if (expanded === '~' || expanded.startsWith('~/') || expanded.startsWith('~\\')) {
+    expanded = path.join(os.homedir(), expanded.slice(1));
+  }
+  const resolved = path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(process.cwd(), expanded);
+  let stat;
+  try {
+    stat = await fs.stat(resolved);
+  } catch (err: any) {
+    if (err && err.code === 'ENOENT') {
+      throw new Error(`ERR_CWD_NOT_FOUND: Working directory does not exist: ${resolved}`);
+    }
+    throw err;
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(`ERR_CWD_NOT_DIR: Working directory is not a directory: ${resolved}`);
+  }
+  return resolved;
+}
+
 // Track virtual Node sessions (PIDs that are actually Node fallback sessions)
 const virtualNodeSessions = new Map<number, { timeout_ms: number }>();
 let virtualPidCounter = -1000; // Use negative PIDs for virtual sessions
@@ -169,11 +205,32 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
     }
   }
 
+  // Resolve cwd with priority: args.cwd > config.defaultProcessCwd > env
+  // DESKTOP_COMMANDER_DEFAULT_CWD > undefined (legacy: spawn inherits process
+  // cwd). Failure returns a clear error response so AI knows the path was
+  // wrong and doesn't blame the command itself.
+  let resolvedCwd: string | undefined;
+  try {
+    const config = await configManager.getConfig();
+    const cwdHint =
+      parsed.data.cwd ??
+      config.defaultProcessCwd ??
+      process.env.DESKTOP_COMMANDER_DEFAULT_CWD ??
+      undefined;
+    resolvedCwd = await resolveProcessCwd(cwdHint);
+  } catch (err: any) {
+    return {
+      content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+      isError: true,
+    };
+  }
+
   const result = await terminalManager.executeCommand(
     commandToRun,
     parsed.data.timeout_ms,
     shellUsed,
-    parsed.data.verbose_timing || false
+    parsed.data.verbose_timing || false,
+    resolvedCwd
   );
 
   if (result.pid === -1) {

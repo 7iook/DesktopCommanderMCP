@@ -196,7 +196,7 @@ export class TerminalManager {
     }
   }
   
-  async executeCommand(command: string, timeoutMs: number = DEFAULT_COMMAND_TIMEOUT, shell?: string, collectTiming: boolean = false): Promise<CommandExecutionResult> {
+  async executeCommand(command: string, timeoutMs: number = DEFAULT_COMMAND_TIMEOUT, shell?: string, collectTiming: boolean = false, cwd?: string): Promise<CommandExecutionResult> {
     // Get the shell from config if not specified
     let shellToUse: string | boolean | undefined = shell;
     if (!shellToUse) {
@@ -253,6 +253,15 @@ export class TerminalManager {
         },
         windowsHide: true  // Prevent visible console windows on Windows
       };
+    }
+
+    // Apply cwd if provided. Caller (startProcess) is responsible for
+    // expanding ~ and validating the directory exists; we just trust the
+    // resolved absolute path here. If cwd is undefined, spawn inherits the
+    // parent process cwd — preserves legacy behavior for callers that don't
+    // pass cwd.
+    if (cwd) {
+      spawnOptions.cwd = cwd;
     }
 
     // Repair PATHEXT on Windows before spawning. On some Windows DXT launches

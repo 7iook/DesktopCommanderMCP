@@ -24,6 +24,14 @@ export const StartProcessArgsSchema = z.object({
   timeout_ms: z.number(),
   shell: z.string().optional(),
   verbose_timing: z.boolean().optional(),
+  // Working directory for the spawned process. mcphub-style transports run
+  // desktop-commander far from the user's IDE workspace, so commands without
+  // an explicit cwd silently land in unexpected places. Resolution order
+  // (high → low): args.cwd → config.defaultProcessCwd → env
+  // DESKTOP_COMMANDER_DEFAULT_CWD → unset (inherits process cwd, legacy).
+  // Path may use ~ (expanded to home) and may be relative (resolved against
+  // process.cwd). Must point to an existing directory.
+  cwd: z.string().optional(),
 });
 
 export const ReadProcessOutputArgsSchema = z.object({

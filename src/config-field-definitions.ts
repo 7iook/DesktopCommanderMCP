@@ -53,6 +53,11 @@ export const CONFIG_FIELD_DEFINITIONS = {
     description: 'Maximum characters from the initial output buffer included in start_process response. Per-session ring buffer keeps the full output (50MB cap), readable via read_process_output. Default 16000.',
     valueType: 'number',
   },
+  defaultProcessCwd: {
+    label: 'Default Process Working Directory',
+    description: 'Default cwd for start_process when the call does not pass an explicit cwd. Useful when desktop-commander is spawned by a parent (mcphub, remote bridge, etc.) whose own cwd is not where you want commands to run. Path may use ~ for home. Falls back to env DESKTOP_COMMANDER_DEFAULT_CWD, then to the inherited process cwd.',
+    valueType: 'string',
+  },
 } as const satisfies Record<string, ConfigFieldDefinition>;
 
 export type ConfigFieldKey = keyof typeof CONFIG_FIELD_DEFINITIONS;
