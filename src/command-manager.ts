@@ -3,6 +3,24 @@ import {configManager} from './config-manager.js';
 import {capture} from "./utils/capture.js";
 
 class CommandManager {
+    /**
+     * "Remote shell" wrappers whose argument list is interpreted by ANOTHER
+     * shell (a remote host or another machine), not the local one. The local
+     * `blockedCommands` list is meaningless against those — `sudo` inside
+     * `ssh host '...'` runs on the remote box; mkfs inside `ssh host '...'`
+     * does the same. extractCommands' "recurse into $()/`` ` ``even inside
+     * quotes" defense was designed to stop *local* subshell bypass, but for
+     * these wrappers it produces false positives that block legitimate
+     * remote admin commands.
+     *
+     * For these wrappers we ONLY validate the wrapper itself — if the user
+     * has explicitly blocked `ssh`, the call is rejected; otherwise the
+     * remote arguments are not inspected. (bash/sh/docker exec deliberately
+     * NOT in this list — they run code on THIS machine.)
+     */
+    private static REMOTE_SHELL_WRAPPERS = new Set([
+        'ssh', 'scp', 'sftp', 'rsync', 'mosh',
+    ]);
 
     getBaseCommand(command: string) {
         return command.split(' ')[0].toLowerCase().trim();
@@ -12,6 +30,16 @@ class CommandManager {
         try {
             // Trim any leading/trailing whitespace
             commandString = commandString.trim();
+
+            // Fast path: when the entire command starts with a known REMOTE
+            // shell wrapper, only check the wrapper's base name. Everything
+            // after runs on a different host, so the local blocklist
+            // semantics (and especially extractCommands' aggressive $()/
+            // backtick recursion) do not apply.
+            const baseTopCmd = this.getBaseCommand(commandString);
+            if (CommandManager.REMOTE_SHELL_WRAPPERS.has(baseTopCmd)) {
+                return [baseTopCmd];
+            }
 
             // Define command separators - these are the operators that can chain commands
             const separators = [';', '&&', '||', '|', '&'];

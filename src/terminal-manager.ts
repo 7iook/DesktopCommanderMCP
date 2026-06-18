@@ -291,12 +291,14 @@ export class TerminalManager {
     // For REPL interactions, we need to ensure stdin, stdout, and stderr are properly configured
     // Note: No special stdio options needed here, Node.js handles pipes by default
 
-    // Enhance SSH commands automatically
+    // NOTE: We do NOT auto-inject `ssh -t` here. spawn child stdin is a pipe,
+    // not a tty; forcing -t makes ssh print "Pseudo-terminal will not be
+    // allocated because stdin is not a terminal." on every call. ssh's
+    // default behavior (no -t) already does the right thing — allocates a
+    // pty when stdin is a tty, skips when piped. Users who actually need a
+    // remote pty can pass `-tt` explicitly. (Removed the legacy auto-`-t`
+    // enhancement after observing it was only ever producing stderr noise.)
     let enhancedCommand = command;
-    if (command.trim().startsWith('ssh ') && !command.includes(' -t')) {
-      enhancedCommand = command.replace(/^ssh /, 'ssh -t ');
-      console.log(`Enhanced SSH command: ${enhancedCommand}`);
-    }
 
     // Get the appropriate spawn configuration for the shell
     let spawnConfig: ShellSpawnConfig;
