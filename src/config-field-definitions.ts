@@ -58,6 +58,11 @@ export const CONFIG_FIELD_DEFINITIONS = {
     description: 'Default cwd for start_process when the call does not pass an explicit cwd. Useful when desktop-commander is spawned by a parent (mcphub, remote bridge, etc.) whose own cwd is not where you want commands to run. Path may use ~ for home. Falls back to env DESKTOP_COMMANDER_DEFAULT_CWD, then to the inherited process cwd.',
     valueType: 'string',
   },
+  disableShellEncodingPatching: {
+    label: 'Disable Shell Encoding Patching',
+    description: 'When false (default), start_process automatically (1) injects a UTF-8 encoding switch before PowerShell / cmd commands so non-ASCII output (CJK, umlauts, emoji) round-trips correctly on Windows, and (2) passes -OutputFormat Text to PowerShell to suppress CLIXML XML serialization noise. Set to true only if a command explicitly relies on the OEM code page or PowerShell CLIXML output.',
+    valueType: 'boolean',
+  },
 } as const satisfies Record<string, ConfigFieldDefinition>;
 
 export type ConfigFieldKey = keyof typeof CONFIG_FIELD_DEFINITIONS;

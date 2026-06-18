@@ -89,6 +89,61 @@ function encodePowerShellCommand(command: string): string {
 }
 
 /**
+ * UTF-8 prefix injected before user PowerShell commands when
+ * `disableShellEncodingPatching` is false (default).
+ *
+ * Why: Windows PowerShell 5.1's [Console]::OutputEncoding defaults to the OEM
+ * code page (936/950/...) — child stdout emits non-UTF-8 bytes that Node
+ * decodes as UTF-8 → mojibake (claude-code #7332, #46486, #9723). pwsh 7+
+ * defaults to UTF-8 but inheriting it from a redirected-stdin spawn isn't
+ * reliable. Inject the trio explicitly per-call so the result is independent
+ * of the user's PS profile and version.
+ *
+ * `$ProgressPreference='SilentlyContinue'` suppresses progress records, which
+ * PS 5.1 emits on stderr as CLIXML even with `-OutputFormat Text` set. Without
+ * this, every PS call dumps ~1KB of `<Obj S="progress">` XML noise that AI
+ * agents have no use for.
+ */
+const POWERSHELL_UTF8_PREFIX =
+  '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;' +
+  '$OutputEncoding=[System.Text.Encoding]::UTF8;' +
+  '[Console]::InputEncoding=[System.Text.Encoding]::UTF8;' +
+  "$ProgressPreference='SilentlyContinue';";
+
+// NOTE on cmd.exe and CJK: cmd parses its command line using the OEM code
+// page (936/950/...) at spawn time — `chcp 65001` only affects subsequent
+// OUTPUT, not the parsing of the literal arguments cmd already received.
+// Injecting `chcp 65001` therefore makes things WORSE (OEM-encoded literals
+// then get reinterpreted as UTF-8 on output → mojibake). cmd CJK output is
+// fundamentally unreliable from a child process; AI agents that need CJK
+// output should use `pwsh` or `powershell` instead.
+
+/**
+ * Strip PowerShell CLIXML wire-format noise from captured output.
+ *
+ * When PowerShell's stdin is redirected (i.e. spawned as a child), it emits
+ * a "#< CLIXML" header followed by `<Objs>` XML blocks for the progress /
+ * information / error streams. PS 5.1 emits these even with -OutputFormat
+ * Text because module-loading progress fires BEFORE our $ProgressPreference
+ * prefix runs. AI agents have no use for the XML; it just buries real output
+ * in 1-2KB of `<Obj S="progress">` noise.
+ *
+ * Removes:
+ *   - "#< CLIXML\r\n" header marker
+ *   - any complete "<Objs ...>...</Objs>" XML blocks
+ *   - resulting blank-line clusters at the very start of the output
+ *
+ * Leaves the actual user output (text between CLIXML envelopes) intact.
+ */
+function stripPsCliXml(text: string): string {
+  if (!text || (!text.includes('#< CLIXML') && !text.includes('<Objs'))) return text;
+  return text
+    .replace(/#< CLIXML\r?\n/g, '')
+    .replace(/<Objs [\s\S]*?<\/Objs>/g, '')
+    .replace(/^[\r\n]+/, '');
+}
+
+/**
  * Configuration for spawning a shell with appropriate flags
  */
 interface ShellSpawnConfig {
@@ -98,71 +153,94 @@ interface ShellSpawnConfig {
   // When true, pass args verbatim on Windows (see executeCommand). Only cmd.exe
   // needs this; its quote parsing conflicts with libuv's default \" escaping.
   windowsVerbatim?: boolean;
+  // When true, strip PowerShell CLIXML noise from output before returning.
+  // Set on pwsh/powershell branches when patchEncoding is on.
+  stripCliXml?: boolean;
 }
 
 /**
  * Get the appropriate spawn configuration for a given shell
- * This handles login shell flags for different shell types
+ * This handles login shell flags for different shell types.
+ *
+ * `patchEncoding` controls UTF-8 prefix injection (default true). On Windows
+ * PowerShell 5.1 / cmd, child stdout emits non-UTF-8 bytes by default, which
+ * Node decodes as UTF-8 → mojibake for any non-ASCII output. The prefix
+ * switches the child's encoding to UTF-8 for the duration of that one
+ * subprocess only. Set `disableShellEncodingPatching` config to opt out.
+ *
+ * For PowerShell, also injects -OutputFormat Text to suppress CLIXML
+ * serialization on redirected stdout (Microsoft's PS-to-PS XML wire format
+ * that AI agents have no use for and just adds 1-2KB of XML noise per call).
  */
-function getShellSpawnArgs(shellPath: string, command: string): ShellSpawnConfig {
+function getShellSpawnArgs(shellPath: string, command: string, patchEncoding: boolean = true): ShellSpawnConfig {
   const shellName = path.basename(shellPath).toLowerCase();
-  
-  // Unix shells with login flag support
+
+  // Unix shells with login flag support (default UTF-8 — no prefix needed)
   if (shellName.includes('bash') || shellName.includes('zsh')) {
-    return { 
-      executable: shellPath, 
+    return {
+      executable: shellPath,
       args: ['-l', '-c', command],
-      useShellOption: false 
+      useShellOption: false
     };
   }
-  
+
   // PowerShell Core (cross-platform, supports -Login)
   // Use -EncodedCommand instead of -Command to bypass PS's command-line
   // tokenizer; otherwise variables ($_, $env:*), back-ticks, and embedded
   // quotes get mangled before the script body runs (upstream #350, bug.md).
   // -Login still applies — it controls profile loading, not the command source.
   if (shellName === 'pwsh' || shellName === 'pwsh.exe') {
+    const wrappedCommand = patchEncoding ? POWERSHELL_UTF8_PREFIX + command : command;
+    const args = ['-Login', '-NoLogo', '-NonInteractive'];
+    if (patchEncoding) args.push('-OutputFormat', 'Text');  // suppress CLIXML
+    args.push('-EncodedCommand', encodePowerShellCommand(wrappedCommand));
     return {
       executable: shellPath,
-      args: ['-Login', '-EncodedCommand', encodePowerShellCommand(command)],
-      useShellOption: false
+      args,
+      useShellOption: false,
+      stripCliXml: patchEncoding
     };
   }
 
   // Windows PowerShell 5.1 (no -Login support)
   if (shellName === 'powershell' || shellName === 'powershell.exe') {
+    const wrappedCommand = patchEncoding ? POWERSHELL_UTF8_PREFIX + command : command;
+    const args = ['-NoLogo', '-NonInteractive'];
+    if (patchEncoding) args.push('-OutputFormat', 'Text');  // suppress CLIXML
+    args.push('-EncodedCommand', encodePowerShellCommand(wrappedCommand));
     return {
       executable: shellPath,
-      args: ['-EncodedCommand', encodePowerShellCommand(command)],
+      args,
+      useShellOption: false,
+      stripCliXml: patchEncoding
+    };
+  }
+
+  // CMD — encoding patching intentionally NOT applied (see CMD note above).
+  if (shellName === 'cmd' || shellName === 'cmd.exe') {
+    return {
+      executable: shellPath,
+      args: ['/c', command],
+      windowsVerbatim: true,
       useShellOption: false
     };
   }
-  
-  // CMD
-  if (shellName === 'cmd' || shellName === 'cmd.exe') {
-    return { 
-      executable: shellPath, 
-      args: ['/c', command],
-      windowsVerbatim: true,
-      useShellOption: false 
-    };
-  }
-  
+
   // Fish shell (uses -l for login, -c for command)
   if (shellName.includes('fish')) {
-    return { 
-      executable: shellPath, 
+    return {
+      executable: shellPath,
       args: ['-l', '-c', command],
-      useShellOption: false 
+      useShellOption: false
     };
   }
-  
+
   // Unknown/other shells - use shell option for safety
   // This provides a fallback for shells we don't explicitly handle
-  return { 
+  return {
     executable: command,
     args: [],
-    useShellOption: shellPath 
+    useShellOption: shellPath
   };
 }
 
@@ -197,17 +275,18 @@ export class TerminalManager {
   }
   
   async executeCommand(command: string, timeoutMs: number = DEFAULT_COMMAND_TIMEOUT, shell?: string, collectTiming: boolean = false, cwd?: string, envOverrides?: Record<string, string>): Promise<CommandExecutionResult> {
-    // Get the shell from config if not specified
-    let shellToUse: string | boolean | undefined = shell;
-    if (!shellToUse) {
-      try {
-        const config = await configManager.getConfig();
-        shellToUse = config.defaultShell || true;
-      } catch (error) {
-        // If there's an error getting the config, fall back to default
-        shellToUse = true;
-      }
+    // Read config once for shell + encoding-patching decisions. Failure falls
+    // back to safe defaults (default shell, encoding patching ON).
+    let configShell: string | undefined;
+    let patchEncoding = true;
+    try {
+      const config = await configManager.getConfig();
+      configShell = config.defaultShell;
+      patchEncoding = config.disableShellEncodingPatching !== true;
+    } catch (error) {
+      // Keep defaults
     }
+    let shellToUse: string | boolean | undefined = shell ?? configShell ?? true;
 
     // For REPL interactions, we need to ensure stdin, stdout, and stderr are properly configured
     // Note: No special stdio options needed here, Node.js handles pipes by default
@@ -225,7 +304,7 @@ export class TerminalManager {
     
     if (typeof shellToUse === 'string') {
       // Use shell-specific configuration with login flags where appropriate
-      spawnConfig = getShellSpawnArgs(shellToUse, enhancedCommand);
+      spawnConfig = getShellSpawnArgs(shellToUse, enhancedCommand, patchEncoding);
       spawnOptions = {
         env: {
           ...process.env,
@@ -337,6 +416,16 @@ export class TerminalManager {
         if (resolved) return;
         resolved = true;
         if (periodicCheck) clearInterval(periodicCheck);
+
+        // Strip PowerShell CLIXML wire-format noise from output before
+        // returning. Done here (not per chunk) because <Objs> blocks can span
+        // multiple stdout/stderr data events. The session ring buffer is left
+        // raw — if read_process_output is later used on this PID it gets the
+        // unfiltered stream (CLIXML is mostly a startup artifact and rarely
+        // matters past the initial output).
+        if (spawnConfig.stripCliXml && result.output) {
+          result.output = stripPsCliXml(result.output);
+        }
 
         // Add timing info if requested
         if (collectTiming) {
