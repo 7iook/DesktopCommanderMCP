@@ -230,7 +230,8 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
     parsed.data.timeout_ms,
     shellUsed,
     parsed.data.verbose_timing || false,
-    resolvedCwd
+    resolvedCwd,
+    parsed.data.env
   );
 
   if (result.pid === -1) {

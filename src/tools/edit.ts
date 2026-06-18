@@ -306,15 +306,16 @@ RECOMMENDATION: For large search/replace operations, consider breaking them into
         if (similarity >= FUZZY_THRESHOLD) {
             // Capture the fuzzy search event with all data
             capture('server_fuzzy_search_performed', fuzzySearchData);
-            
+
             // If we allow fuzzy matches, we would make the replacement here
             // For now, we'll return a detailed message about the fuzzy match
+            const groundTruth = extractContextAround(content, fuzzyResult.value);
             return {
-                content: [{ 
-                    type: "text", 
+                content: [{
+                    type: "text",
                     text: `Exact match not found, but found a similar text with ${Math.round(similarity * 100)}% similarity (found in ${executionTime.toFixed(2)}ms):\n\n` +
                           `Differences:\n${diff}\n\n` +
-                          `To replace this text, use the exact text found in the file.\n\n` +
+                          `Actual file content (copy this verbatim as your next old_string):\n${groundTruth}\n\n` +
                           `Log entry saved for analysis. Use the following command to check the log:\n` +
                           `Check log: ${await fuzzySearchLogger.getLogPath()}`
                 }],// TODO
@@ -326,13 +327,16 @@ RECOMMENDATION: For large search/replace operations, consider breaking them into
                 ...fuzzySearchData,
                 below_threshold: true
             });
-            
+
+            const groundTruth = extractContextAround(content, fuzzyResult.value);
             return {
-                content: [{ 
-                    type: "text", 
-                    text: `Search content not found in ${filePath}. The closest match was "${fuzzyResult.value}" ` +
+                content: [{
+                    type: "text",
+                    text: `Search content not found in ${filePath}. The closest match was "${fuzzyResult.value.slice(0, 200)}${fuzzyResult.value.length > 200 ? '...' : ''}" ` +
                           `with only ${Math.round(similarity * 100)}% similarity, which is below the ${Math.round(FUZZY_THRESHOLD * 100)}% threshold. ` +
                           `(Fuzzy search completed in ${executionTime.toFixed(2)}ms)\n\n` +
+                          `Closest region in file:\n${groundTruth}\n\n` +
+                          `Tip: copy a UNIQUE fragment of the actual content above as your new old_string, or use read_file with offset around those lines for more context.\n\n` +
                           `Log entry saved for analysis. Use the following command to check the log:\n` +
                           `Check log: ${await fuzzySearchLogger.getLogPath()}`
                 }],
@@ -341,6 +345,43 @@ RECOMMENDATION: For large search/replace operations, consider breaking them into
     }
     
     throw new Error("Unexpected error during search and replace operation.");
+}
+
+/**
+ * Extract a numbered code block around `anchor` from `content`.
+ *
+ * When edit_block can't find `old_string` exactly, the AI is left guessing
+ * what whitespace / line endings / hidden chars actually live in the file.
+ * Returning a real-bytes snapshot of the closest matching region (the fuzzy
+ * "value") with line numbers and ±N lines of context lets the AI just
+ * copy the actual content as the next attempt's old_string — no extra
+ * read_file round-trip needed.
+ *
+ * Bounded to maxChars (default 1500) so a long fuzzy match doesn't itself
+ * become a context-overflow source.
+ */
+function extractContextAround(content: string, anchor: string, contextLines: number = 5, maxChars: number = 1500): string {
+    if (!anchor) return '<no anchor>';
+    const idx = content.indexOf(anchor);
+    const allLines = content.split('\n');
+    if (idx < 0) {
+        // Anchor not located byte-for-byte (rare — fuzzy normalization may have
+        // altered whitespace). Degrade gracefully: still useful to dump the
+        // anchor itself so AI can compare to its own search string.
+        const head = anchor.length > maxChars ? anchor.slice(0, maxChars) + `\n... (truncated, full ${anchor.length} chars)` : anchor;
+        return `<closest fuzzy match (anchor not byte-located in file; ${anchor.length} chars):>\n${head}`;
+    }
+    const startLine = content.slice(0, idx).split('\n').length;
+    const endLine = content.slice(0, idx + anchor.length).split('\n').length;
+    const fromLine = Math.max(1, startLine - contextLines);
+    const toLine = Math.min(allLines.length, endLine + contextLines);
+    const slice = allLines.slice(fromLine - 1, toLine);
+    const numWidth = String(toLine).length;
+    const numbered = slice.map((line, i) => `${String(fromLine + i).padStart(numWidth, ' ')}  ${line}`).join('\n');
+    if (numbered.length > maxChars) {
+        return numbered.slice(0, maxChars) + `\n... (truncated; full block is ${slice.length} lines, ${numbered.length} chars)`;
+    }
+    return `Lines ${fromLine}-${toLine} (closest match at lines ${startLine}-${endLine}):\n${numbered}`;
 }
 
 /**

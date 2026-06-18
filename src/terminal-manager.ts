@@ -196,7 +196,7 @@ export class TerminalManager {
     }
   }
   
-  async executeCommand(command: string, timeoutMs: number = DEFAULT_COMMAND_TIMEOUT, shell?: string, collectTiming: boolean = false, cwd?: string): Promise<CommandExecutionResult> {
+  async executeCommand(command: string, timeoutMs: number = DEFAULT_COMMAND_TIMEOUT, shell?: string, collectTiming: boolean = false, cwd?: string, envOverrides?: Record<string, string>): Promise<CommandExecutionResult> {
     // Get the shell from config if not specified
     let shellToUse: string | boolean | undefined = shell;
     if (!shellToUse) {
@@ -262,6 +262,14 @@ export class TerminalManager {
     // pass cwd.
     if (cwd) {
       spawnOptions.cwd = cwd;
+    }
+
+    // Apply per-call env overrides on top of inherited process.env. Cannot
+    // delete inherited vars (only set/override) — use setX in the command
+    // itself if you need to unset. Already-merged spawnOptions.env keeps
+    // TERM=xterm-256color from above; caller overrides win on conflict.
+    if (envOverrides && spawnOptions.env) {
+      spawnOptions.env = { ...spawnOptions.env, ...envOverrides };
     }
 
     // Repair PATHEXT on Windows before spawning. On some Windows DXT launches

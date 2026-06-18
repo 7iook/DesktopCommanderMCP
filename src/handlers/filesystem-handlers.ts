@@ -11,6 +11,7 @@ import {
     type FileResult,
     type MultiFileResult
 } from '../tools/filesystem.js';
+import { inspectFile } from '../tools/inspect.js';
 import type { ReadOptions } from '../utils/files/base.js';
 
 import { ServerResult } from '../types.js';
@@ -27,6 +28,7 @@ import {
     ListDirectoryArgsSchema,
     MoveFileArgsSchema,
     GetFileInfoArgsSchema,
+    InspectFileArgsSchema,
     WritePdfArgsSchema
 } from '../tools/schemas.js';
 import path from 'path';
@@ -523,6 +525,28 @@ export async function handleGetFileInfo(args: unknown): Promise<ServerResult> {
 }
 
 // Use get_config to retrieve the allowedDirectories configuration
+
+/**
+ * Handle inspect_file command — file pre-flight inspection.
+ * Returns a structured JSON object so AI can decide between
+ * read_file / list_directory / start_process before paying read cost.
+ */
+export async function handleInspectFile(args: unknown): Promise<ServerResult> {
+    try {
+        const parsed = InspectFileArgsSchema.parse(args);
+        const result = await inspectFile(parsed.path);
+        return {
+            content: [{
+                type: "text",
+                text: JSON.stringify(result, null, 2)
+            }],
+            structuredContent: result as unknown as Record<string, unknown>,
+        };
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return createErrorResponse(errorMessage);
+    }
+}
 
 /**
  * Handle write_pdf command

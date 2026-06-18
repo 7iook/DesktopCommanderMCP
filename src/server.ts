@@ -37,6 +37,7 @@ import {
     ListDirectoryArgsSchema,
     MoveFileArgsSchema,
     GetFileInfoArgsSchema,
+    InspectFileArgsSchema,
     GetConfigArgsSchema,
     SetConfigValueArgsSchema,
     ListProcessesArgsSchema,
@@ -554,6 +555,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 _meta: buildUiToolMeta(FILE_PREVIEW_RESOURCE_URI, true, showMcpUiPreviews),
                 annotations: {
                     title: "List Directory Contents",
+                    readOnlyHint: true,
+                },
+            },
+            {
+                name: "inspect_file",
+                description: `
+                        Pre-flight inspection of a file. Cheap (reads only the first/last 4KB + a single
+                        fs.stat). Use this BEFORE read_file when you don't yet know the file's shape, to
+                        avoid burning context on something you can't usefully read.
+
+                        Returns a structured JSON object with:
+                        - exists / isFile / isDirectory / size / modified
+                        - mimeType (from extension), isBinary (content detection),
+                          encoding ('utf-8' / 'utf-8-bom' / 'utf-16le' / 'utf-16be' / 'binary' / 'empty' / 'unknown')
+                        - lineCount, longestLineLength, isLikelyMinified (lineCount<=2 && size>10KB && !binary)
+                        - headPreview (~200 chars) and tailPreview (~200 chars)
+                        - recommendation: a one-line guidance string the caller should route on:
+                          * "Safe to read_file in one call"
+                          * "Likely minified — use start_process(jq/python/node) ..."
+                          * "Binary file — use start_process with appropriate tool (Python/Node/jq/exiftool/...)"
+                          * "Large file (N bytes > char cap) — use read_file with offset/length to paginate"
+                          * "Use list_directory(path, depth=1) to see contents"
+                          * "File does not exist"
+
+                        ${PATH_GUIDANCE}
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(InspectFileArgsSchema),
+                annotations: {
+                    title: "Inspect File (pre-flight)",
                     readOnlyHint: true,
                 },
             },
@@ -1422,6 +1452,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
             case "list_directory":
                 result = await handlers.handleListDirectory(args);
+                break;
+
+            case "inspect_file":
+                result = await handlers.handleInspectFile(args);
                 break;
 
             case "move_file":

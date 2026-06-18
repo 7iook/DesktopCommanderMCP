@@ -32,6 +32,11 @@ export const StartProcessArgsSchema = z.object({
   // Path may use ~ (expanded to home) and may be relative (resolved against
   // process.cwd). Must point to an existing directory.
   cwd: z.string().optional(),
+  // Per-call environment overrides. Merged on top of process.env so the
+  // child sees inherited vars plus these. Cannot delete a parent-inherited
+  // var (only set/override). Useful for one-off proxy / token / flag
+  // injection without polluting the global env.
+  env: z.record(z.string()).optional(),
 });
 
 export const ReadProcessOutputArgsSchema = z.object({
@@ -137,6 +142,14 @@ export const MoveFileArgsSchema = z.object({
 });
 
 export const GetFileInfoArgsSchema = z.object({
+  path: z.string(),
+});
+
+// Pre-flight inspection of a file: lightweight stat + head/tail sample +
+// binary / encoding / minified detection. Lets AI decide between
+// read_file / list_directory / start_process WITHOUT first paying the cost
+// of read_file on a 5MB minified blob or a binary asset.
+export const InspectFileArgsSchema = z.object({
   path: z.string(),
 });
 
@@ -255,6 +268,7 @@ export const toolArgSchemas: Record<string, z.ZodTypeAny> = {
   stop_search: StopSearchArgsSchema,
   list_searches: ListSearchesArgsSchema,
   get_file_info: GetFileInfoArgsSchema,
+  inspect_file: InspectFileArgsSchema,
   edit_block: EditBlockArgsSchema,
   start_process: StartProcessArgsSchema,
   read_process_output: ReadProcessOutputArgsSchema,
