@@ -6,6 +6,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { capture } from '../utils/capture.js';
 import { withTimeout } from '../utils/withTimeout.js';
+import { withFileLock } from '../utils/file-mutex.js';
 import { configManager } from '../config-manager.js';
 import { getFileHandler, TextFileHandler } from '../utils/files/index.js';
 import type { ReadOptions, FileResult, PdfPageItem } from '../utils/files/base.js';
@@ -639,11 +640,25 @@ export async function writeFile(filePath: string, content: string, mode: 'rewrit
         lineCount: lineCount
     });
 
-    // Get appropriate handler for this file type (async - includes binary detection)
-    const handler = await getFileHandler(validPath);
+    // Serialize all writes to the same path so AI agents firing concurrent
+    // edit_block / write_file calls on one file don't lose N-1 updates to
+    // the lost-update race (see src/utils/file-mutex.ts).
+    return withFileLock(validPath, async () => {
+        // Auto-create parent directory (mkdir -p semantics). recursive:true is
+        // safe — existing directories are NOT modified per Node fs docs; if
+        // every component already exists this is a no-op. Frees AI from
+        // having to call create_directory before write_file on a fresh path.
+        const parentDir = path.dirname(validPath);
+        if (parentDir && parentDir !== validPath) {
+            await fs.mkdir(parentDir, { recursive: true });
+        }
 
-    // Use handler to write the file
-    await handler.write(validPath, content, mode);
+        // Get appropriate handler for this file type (async — includes binary detection)
+        const handler = await getFileHandler(validPath);
+
+        // Use handler to write the file
+        await handler.write(validPath, content, mode);
+    });
 }
 
 export interface MultiFileResult {

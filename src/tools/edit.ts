@@ -20,6 +20,8 @@ import fs from 'fs/promises';
 import { ServerResult } from '../types.js';
 import { runFuzzySearchInWorker, getSimilarityRatio } from './fuzzySearch.js';
 import { capture } from '../utils/capture.js';
+import { withFileLock } from '../utils/file-mutex.js';
+import { getFileHandler } from '../utils/files/index.js';
 import { createErrorResponse } from '../error-handlers.js';
 import { EditBlockArgsSchema } from "./schemas.js";
 import path from 'path';
@@ -142,7 +144,14 @@ export async function performSearchReplace(filePath: string, block: SearchReplac
 
     // Read file directly to preserve line endings - critical for edit operations
     const validPath = await validatePath(filePath);
-    const content = await readFileInternal(validPath, 0, Number.MAX_SAFE_INTEGER);
+
+    // Serialize against concurrent edits/writes on the same file. Without
+    // this, N concurrent edit_block calls each read V1, each compute a
+    // different V2, last writer wins → N-1 lost updates. (.race-repro.mjs
+    // demonstrates 4-of-5 lost on the unlocked path.) Same per-path queue
+    // used by writeFile so cross-tool concurrency is also serialized.
+    return withFileLock(validPath, async () => {
+        const content = await readFileInternal(validPath, 0, Number.MAX_SAFE_INTEGER);
     
     // Make sure content is a string
     if (typeof content !== 'string') {
@@ -200,8 +209,14 @@ export async function performSearchReplace(filePath: string, block: SearchReplac
 RECOMMENDATION: For large search/replace operations, consider breaking them into smaller chunks with fewer lines.`;
         }
         
-        await writeFile(filePath, newContent);
+        // Direct handler.write here (not the higher-level writeFile) because
+        // we already hold the per-path lock — calling writeFile() would try
+        // to re-acquire the same lock and deadlock. The file already exists
+        // (we just read it), so no parent-mkdir is needed either.
+        const handler = await getFileHandler(validPath);
+        await handler.write(validPath, newContent, 'rewrite');
         capture('server_edit_block_exact_success', {fileExtension: fileExtension, expectedReplacements, hasWarning: warningMessage !== ""});
+
         const resolvedEditPath = resolveAbsolutePath(filePath);
 
         // Show a partial preview centered on the edited area
@@ -345,6 +360,7 @@ RECOMMENDATION: For large search/replace operations, consider breaking them into
     }
     
     throw new Error("Unexpected error during search and replace operation.");
+    });  // close withFileLock
 }
 
 /**
