@@ -4,6 +4,7 @@ import { StartProcessArgsSchema, ReadProcessOutputArgsSchema, InteractWithProces
 import { capture } from "../utils/capture.js";
 import { ServerResult } from '../types.js';
 import { analyzeProcessState, cleanProcessOutput, formatProcessStateMessage, ProcessState } from '../utils/process-detection.js';
+import { applyResponseCharCap } from '../utils/response-cap.js';
 import * as os from 'os';
 import { configManager } from '../config-manager.js';
 import { spawn } from 'child_process';
@@ -15,26 +16,6 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const mcpRoot = path.resolve(__dirname, '..', '..');
-
-/**
- * Char-level cap for tool responses.
- *
- * Hosts that don't auto-truncate (Kiro IDE notably) can be locked up by a
- * single 100KB+ response — listing 10k files in a process buffer, dumping a
- * deeply recursive ls, etc. We keep the tail (most recent output is usually
- * what matters for state detection / prompt recognition) and prepend a hint.
- *
- * The per-session 50MB ring buffer (MAX_BUFFERED_OUTPUT_CHARS) is unaffected;
- * full output is always available via paginated read_process_output.
- */
-function applyResponseCharCap(text: string, maxChars: number, hint: string): string {
-  if (text.length <= maxChars) return text;
-  const tail = text.slice(text.length - maxChars);
-  // Snap to next newline so the truncation marker isn't mid-line.
-  const firstNl = tail.indexOf('\n');
-  const cleanTail = firstNl > 0 && firstNl < maxChars * 0.05 ? tail.slice(firstNl + 1) : tail;
-  return `[...truncated ${text.length - cleanTail.length} chars; ${hint}]\n${cleanTail}`;
-}
 
 // Track virtual Node sessions (PIDs that are actually Node fallback sessions)
 const virtualNodeSessions = new Map<number, { timeout_ms: number }>();

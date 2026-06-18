@@ -17,6 +17,7 @@ import { ServerResult } from '../types.js';
 import { withTimeout } from '../utils/withTimeout.js';
 import { createErrorResponse } from '../error-handlers.js';
 import { configManager } from '../config-manager.js';
+import { applyReadFileCharCap } from '../utils/response-cap.js';
 
 import {
     ReadFileArgsSchema,
@@ -183,11 +184,17 @@ export async function handleReadFile(args: unknown): Promise<ServerResult> {
             };
         } else {
             // For all other files, return as text.
-            // structuredContent carries only file metadata (no content duplication);
-            // the widget reads text from the MCP content array.
-            const textContent = typeof fileResult.content === 'string'
+            // Char-level cap protects against single-line minified files
+            // (e.g., 5MB single-line JSON) that bypass the line-based length
+            // limit (length=1000 means "1 line == whole file" for minified).
+            // Both content[0].text and structuredContent.content carry the
+            // capped text so hosts that index either can't lock up.
+            const rawTextContent = typeof fileResult.content === 'string'
                 ? fileResult.content
                 : fileResult.content.toString('utf8');
+            const responseMaxChars = config.responseMaxChars ?? 50000;
+            const capResult = applyReadFileCharCap(rawTextContent, responseMaxChars);
+            const textContent = capResult.text;
             const fileType = fileResult.metadata?.isDirectory ? 'directory' as const : resolvePreviewFileType(resolvedFilePath);
             return {
                 content: [{ type: "text", text: textContent }],
