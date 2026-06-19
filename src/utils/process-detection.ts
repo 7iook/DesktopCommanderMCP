@@ -225,7 +225,12 @@ function escapeRegExp(string: string): string {
  */
 export function formatProcessStateMessage(state: ProcessState, pid: number): string {
   if (state.isWaitingForInput) {
-    return `Process ${pid} is waiting for input${state.detectedPrompt ? ` (detected: "${state.detectedPrompt.trim()}")` : ''}`;
+    // Only show the (detected: "...") fragment when we actually have a
+    // non-empty prompt fragment to show. Previously a blank `detectedPrompt`
+    // (whitespace-only or all-trimmed-away) produced the cosmetic-but-noisy
+    // `(detected: "")` annotation.
+    const trimmedPrompt = state.detectedPrompt?.trim();
+    return `Process ${pid} is waiting for input${trimmedPrompt ? ` (detected: "${trimmedPrompt}")` : ''}`;
   } else if (state.isFinished) {
     return `Process ${pid} has finished execution`;
   } else {

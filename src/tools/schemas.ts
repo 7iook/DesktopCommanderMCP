@@ -206,6 +206,19 @@ export const InteractWithProcessArgsSchema = z.object({
   // ("y" / "n" / "1"), control characters ("\u0003" = Ctrl+C, "\u0004" = EOF),
   // or any prompt that reads one char without waiting for Enter.
   append_newline: z.boolean().optional().default(true),
+  // Long-running mode. When true, do NOT report ✅ finished based on:
+  //   (a) silence-based heuristics (no new output for X seconds)
+  //   (b) the spawned shell's session being absent from the internal map
+  // Many real long-runners (test suites, batch jobs, browser automation) go
+  // silent for tens of seconds during sleeps/network waits and the spawned
+  // shell can also exit before its grand-children (a Rust CLI that fork-execs
+  // chrome.exe and continues using it). Treating those as "finished" makes
+  // callers move on while work is still in-flight. With this flag set, the
+  // tool will only report finished when an OS-level PID liveness check
+  // (process.kill(pid, 0)) confirms the spawned shell PID is gone AND the
+  // text-based isFinished heuristic fires — and even then it stays running
+  // if the OS check disagrees. Default false preserves legacy fast-path.
+  expect_long_running: z.boolean().optional().default(false),
 });
 
 // Usage stats schema

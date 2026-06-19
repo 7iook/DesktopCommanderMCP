@@ -58,6 +58,41 @@ const virtualNodeSessions = new Map<number, { timeout_ms: number }>();
 let virtualPidCounter = -1000; // Use negative PIDs for virtual sessions
 
 /**
+ * OS-level liveness check for a PID. Independent of desktop-commander's
+ * internal session map.
+ *
+ * Why this exists: the fast-path in interactWithProcess used to assume
+ * `terminalManager.getSession(pid) === undefined` means "process finished",
+ * which is only true if the spawned shell's `'exit'` event fired correctly.
+ * Real-world failures (Windows ConPTY edge cases, IPC handle weirdness, or
+ * a shell that exits before its grand-child like a Rust CLI fork-execing
+ * chrome.exe and continuing) caused that fast-path to misreport ✅ finished
+ * while the user-visible work was still running, leaving callers to move
+ * on prematurely.
+ *
+ * `process.kill(pid, 0)` doesn't actually send a signal — it just probes.
+ *   - returns true (no throw): PID exists in the OS process table
+ *   - throws ESRCH: PID is not in the table → confirmed dead
+ *   - throws EPERM: PID exists but we lack permission → still alive
+ *   - other throws: treat as alive (better to over-wait than to lie about finished)
+ *
+ * Caveat: OS recycles PIDs. Short-term (within a single tool call window)
+ * recycling is vanishingly rare on modern systems, so this is acceptable
+ * as a tie-breaker — not as a long-term identity check.
+ */
+function isPidAlive(pid: number): boolean {
+  if (!pid || pid < 0) return false; // virtual / invalid
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    if (err && err.code === 'ESRCH') return false;
+    if (err && err.code === 'EPERM') return true;
+    return true; // unknown — bias to "still alive" so we don't lie
+  }
+}
+
+/**
  * Execute Node.js code via temp file (fallback when Python unavailable)
  * Creates temp .mjs file in MCP directory for ES module import access
  */
@@ -250,10 +285,19 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
   // though the wrapper itself is unnecessary — flagging those would be
   // a false positive.
   const PS_NESTED_WRAPPER = /^\s*(?:powershell|pwsh)(?:\.exe)?\s+(?:-\w+\s+)*-c(?:ommand)?\s+"/i;
+  // Detect another common Windows trap: `cmd /c timeout /t N` (or bare
+  // `timeout /t N`). timeout.exe needs a real console handle that
+  // desktop-commander's piped stdio shell does NOT provide, so it bails
+  // out immediately with "ERROR: Input redirection is not supported" and
+  // any commands chained after it run with zero wait — the equivalent of
+  // `Start-Sleep` not happening at all. Only a recommendation; we do not
+  // rewrite the command.
+  const CMD_TIMEOUT_TRAP = /(?:^|[\s&|;])(?:cmd(?:\.exe)?\s+\/c\s+)?timeout(?:\.exe)?\s+\/t\s+\d+/i;
   let antiPatternHint = '';
   if (PS_NESTED_WRAPPER.test(commandToRun) && /\$[_\w:]/.test(commandToRun)) {
     antiPatternHint =
-      `\n\n⚠️ Possible anti-pattern detected: nested \`powershell/pwsh -Command "..."\` wrapper containing $variables.\n` +
+      `\n\n⚠️ Anti-pattern HINT — your command DID execute as-is, this is just guidance:\n` +
+      `Nested \`powershell/pwsh -Command "..."\` wrapper containing $variables.\n` +
       `desktop-commander already runs your command in a PowerShell shell. The OUTER shell expands\n` +
       `$_ / $env:* / $var inside the double-quoted argument BEFORE passing the string to the inner\n` +
       `powershell — that's why $_.Name becomes .Name and the inner pipeline fails.\n` +
@@ -261,6 +305,19 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
       `you don't need a temp .ps1 workaround unless the command genuinely requires it.)\n` +
       `  Bad:  powershell -Command "Get-Process | %{ $_.Name }"\n` +
       `  Good: Get-Process | %{ $_.Name }\n`;
+  }
+  if (CMD_TIMEOUT_TRAP.test(commandToRun)) {
+    antiPatternHint +=
+      `\n\n⚠️ Anti-pattern HINT — your command DID execute as-is, this is just guidance:\n` +
+      `\`timeout /t N\` was detected. timeout.exe requires a real console handle that\n` +
+      `desktop-commander's piped stdio shell does NOT provide. In this environment,\n` +
+      `\`timeout /t N\` exits immediately with "Input redirection is not supported"\n` +
+      `and any commands chained after it run with zero wait — your sleep didn't happen.\n` +
+      `Use PowerShell \`Start-Sleep\` instead (no console handle needed):\n` +
+      `  Bad:  cmd /c "timeout /t 90 /nobreak >nul & echo done"\n` +
+      `  Good: powershell -NoProfile -Command "Start-Sleep -Seconds 90; Write-Output done"\n` +
+      `(That is a nested powershell wrapper, but with NO $variable — the other anti-pattern\n` +
+      `hint is scoped to nested-wrapper + $variable specifically and won't fire here.)\n`;
   }
 
   if (result.pid === -1) {
@@ -512,7 +569,8 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
     timeout_ms = 8000,
     wait_for_prompt = true,
     verbose_timing = false,
-    append_newline = true
+    append_newline = true,
+    expect_long_running = false
   } = parsed.data;
 
   // Get config for output line limit
@@ -618,26 +676,52 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
           // "done." then exits sits in the loop until timeout_ms because
           // analyzeProcessState's text-based isFinished heuristic doesn't
           // know about real process lifecycle.
+          //
+          // BUT: the internal session map being empty is only a *first*
+          // signal — desktop-commander's `'exit'` listener fires for the
+          // *spawned shell*, not for grand-children. A Rust CLI that
+          // fork-execs chrome.exe (and keeps using it) can leave the shell
+          // dead but the real work running, and Windows ConPTY edge cases
+          // can fire 'exit' even earlier. Verify with an OS-level PID
+          // liveness check before claiming finished. If the OS says the
+          // PID is still alive, we trust the OS over the stale Map and
+          // continue polling instead of misreporting ✅ finished.
           if (!terminalManager.getSession(pid)) {
-            const flush = outputSnapshot
-              ? terminalManager.getOutputSinceSnapshot(pid, outputSnapshot)
-              : terminalManager.getNewOutput(pid);
-            if (flush && flush.length > lastOutputLength) {
-              output = flush;
-              lastOutputLength = flush.length;
+            const stillAlive = isPidAlive(pid);
+            if (stillAlive) {
+              // Map is stale; flush whatever output we have and keep waiting.
+              // Don't synthesize isFinished — the next poll iteration handles
+              // detection normally.
+              const flushAlive = outputSnapshot
+                ? terminalManager.getOutputSinceSnapshot(pid, outputSnapshot)
+                : terminalManager.getNewOutput(pid);
+              if (flushAlive && flushAlive.length > lastOutputLength) {
+                output = flushAlive;
+                lastOutputLength = flushAlive.length;
+              }
+              // Fall through to the normal new-output / prompt detection below.
+            } else {
+              // OS confirms PID is gone (ESRCH) — finished for real.
+              const flush = outputSnapshot
+                ? terminalManager.getOutputSinceSnapshot(pid, outputSnapshot)
+                : terminalManager.getNewOutput(pid);
+              if (flush && flush.length > lastOutputLength) {
+                output = flush;
+                lastOutputLength = flush.length;
+              }
+              // Mark as a clean early exit so the downstream summary doesn't
+              // tag this as "Response may be incomplete (timeout reached)".
+              earlyExit = true;
+              exitReason = 'process_finished';
+              // Synthesize an isFinished state so the post-loop summary picks
+              // the ✅ "Process N has finished execution" branch.
+              processState = analyzeProcessState(output, pid);
+              processState.isFinished = true;
+              processState.isWaitingForInput = false;
+              processState.isRunning = false;
+              resolveOnce();
+              return;
             }
-            // Mark as a clean early exit so the downstream summary doesn't
-            // tag this as "Response may be incomplete (timeout reached)".
-            earlyExit = true;
-            exitReason = 'process_finished';
-            // Synthesize an isFinished state so the post-loop summary picks
-            // the ✅ "Process N has finished execution" branch.
-            processState = analyzeProcessState(output, pid);
-            processState.isFinished = true;
-            processState.isWaitingForInput = false;
-            processState.isRunning = false;
-            resolveOnce();
-            return;
           }
 
           // Use snapshot-based reading to handle REPL prompt line appending
@@ -679,11 +763,25 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
               return;
             }
 
-            // Also exit if process finished
+            // Also exit if process finished. In long-running mode, double-check
+            // with the OS — long batches frequently print things that match the
+            // text-based COMPLETION_INDICATORS / ERROR_COMPLETION_PATTERNS
+            // ("Error:", "Exception:", a full stack trace from one failing
+            // worker) without the parent process actually having exited.
+            // Trusting the text alone made interact_with_process say
+            // ✅ finished mid-batch and callers moved on prematurely.
             if (processState.isFinished) {
-              exitReason = 'process_finished';
-              resolveOnce();
-              return;
+              if (expect_long_running && isPidAlive(pid)) {
+                // Text says done, but OS says PID is still alive AND user
+                // explicitly opted into long-running mode. Treat the text
+                // signal as a transient log line, not a real completion.
+                processState.isFinished = false;
+                processState.isRunning = true;
+              } else {
+                exitReason = 'process_finished';
+                resolveOnce();
+                return;
+              }
             }
           }
 
