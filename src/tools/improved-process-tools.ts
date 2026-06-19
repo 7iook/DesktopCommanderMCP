@@ -335,6 +335,22 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
   // Analyze the process state to detect if it's waiting for input
   const processState = analyzeProcessState(result.output, result.pid);
 
+  // OS-level liveness override — same root cause as the interact_with_process
+  // fix in 80ee148/0298e12: analyzeProcessState's text heuristic flips
+  // isFinished=true when output matches ERROR_COMPLETION_PATTERNS
+  // (Error: / Exception: / Traceback / Node stack trace) or
+  // COMPLETION_INDICATORS (Process finished / Exit code:). For long-running
+  // processes that print an error early but keep running (Rust trial harness,
+  // test suites with one failing worker, batch jobs) this would label the
+  // session ✅ finished while the PID is still alive — the AI then moves on
+  // to read logs / clean up and the work is left mid-flight. Verify against
+  // the OS before trusting the text signal; if the OS says alive, downgrade
+  // to "running" so the status line reflects ground truth.
+  if (processState.isFinished && isPidAlive(result.pid)) {
+    processState.isFinished = false;
+    processState.isRunning = true;
+  }
+
   let statusMessage = '';
   if (processState.isWaitingForInput) {
     statusMessage = `\n🔄 ${formatProcessStateMessage(processState, result.pid)}`;
