@@ -597,7 +597,16 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
               output = flush;
               lastOutputLength = flush.length;
             }
+            // Mark as a clean early exit so the downstream summary doesn't
+            // tag this as "Response may be incomplete (timeout reached)".
+            earlyExit = true;
             exitReason = 'process_finished';
+            // Synthesize an isFinished state so the post-loop summary picks
+            // the ✅ "Process N has finished execution" branch.
+            processState = analyzeProcessState(output, pid);
+            processState.isFinished = true;
+            processState.isWaitingForInput = false;
+            processState.isRunning = false;
             resolveOnce();
             return;
           }
