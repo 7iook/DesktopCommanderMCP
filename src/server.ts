@@ -51,6 +51,7 @@ import {
     ListSearchesArgsSchema,
     GetPromptsArgsSchema,
     GetRecentToolCallsArgsSchema,
+    GetRecentAnomaliesArgsSchema,
     WritePdfArgsSchema,
     toolArgSchemas,
 } from './tools/schemas.js';
@@ -1171,6 +1172,42 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 },
             },
             {
+                name: "get_recent_anomalies",
+                description: `
+                        Aggregated report of known anti-patterns and recurring failure modes
+                        across recent tool-call history. Read-only — does NOT modify state,
+                        does NOT log itself.
+
+                        Designed to be called once at the start of a new session so prior
+                        failure modes (cmd \`timeout /t N\` trap on Windows stdio shells,
+                        nested \`powershell -Command "..."\` swallowing $variables in the
+                        outer shell, ERR_CWD_NOT_FOUND from missing absolute paths,
+                        edit_block stale-snapshot misses, write_file overwrite blocks,
+                        read_file minified-blob warnings, command-blocked rejections,
+                        interact_with_process input-send failures) surface automatically
+                        instead of you needing to copy-paste them back so the tool can be
+                        fixed manually.
+
+                        Reads from the in-memory tool-call history (last 1000 calls,
+                        same source as get_recent_tool_calls).
+
+                        Useful for:
+                        - First call of a fresh session: "what went wrong yesterday?"
+                        - Spotting a pattern across many calls (3 cmd timeout traps in 1h
+                          → suggests a habit fix, not a one-off mistake)
+                        - Pre-flight before risky multi-step plans
+
+                        Output format: short text block with rule id, hit count, last hit
+                        time, suggestion, and one representative truncated sample.
+
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(GetRecentAnomaliesArgsSchema),
+                annotations: {
+                    title: "Get Recent Tool-Call Anomalies",
+                    readOnlyHint: true,
+                },
+            },
+            {
                 name: "give_feedback_to_desktop_commander",
                 description: `
                         Open feedback form in browser to provide feedback about Desktop Commander.
@@ -1410,6 +1447,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
                 }
                 break;
 
+            case "get_recent_anomalies":
+                try {
+                    result = await handlers.handleGetRecentAnomalies(args);
+                } catch (error) {
+                    capture('server_request_error', { message: `Error in get_recent_anomalies handler: ${error}` });
+                    result = {
+                        content: [{ type: "text", text: `Error: Failed to get tool-call anomaly report` }],
+                        isError: true,
+                    };
+                }
+                break;
+
             case "track_ui_event":
                 try {
                     result = await handlers.handleTrackUiEvent(args);
@@ -1535,11 +1584,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
                 };
         }
 
-        // Add tool call to history (exclude only get_recent_tool_calls to prevent recursion)
+        // Add tool call to history (exclude meta/query tools to prevent recursion
+        // and noise — get_recent_anomalies reads history, so logging it would
+        // both pollute the very dataset it inspects AND cause an infinite loop
+        // if a session-opener prompt invokes it on every turn)
         const duration = Date.now() - startTime;
         isError = !!result.isError;
         const EXCLUDED_TOOLS = [
             'get_recent_tool_calls',
+            'get_recent_anomalies',
             'track_ui_event'
         ];
 

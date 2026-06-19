@@ -276,6 +276,23 @@ export const GetRecentToolCallsArgsSchema = z.object({
   since: z.string().datetime().optional(),
 });
 
+// Anomaly report schema. Read-only aggregator over the existing tool-call
+// history JSONL. Designed for AIs to call once at session start so prior
+// failure modes (cmd timeout trap, nested PS $var swallow, ERR_CWD,
+// edit_block stale snapshot, etc.) surface automatically instead of the
+// user needing to copy-paste them back to fix manually.
+export const GetRecentAnomaliesArgsSchema = z.object({
+  // Time window. 0 / undefined = all-time; positive integer = last N
+  // minutes. Default 1440 = last 24h covers the typical "what went wrong
+  // since yesterday" question without dragging in stale signal.
+  since_minutes: z.number().int().min(0).max(60 * 24 * 30).optional().default(1440),
+  // Minimum hit count for a rule to appear in the report. Default 1
+  // (anything seen even once) — bump up for noisy long windows.
+  min_count: z.number().int().min(1).optional().default(1),
+  // Cap on number of distinct rules to return, ranked by hit count.
+  top: z.number().int().min(1).max(50).optional().default(20),
+});
+
 export const TrackUiEventArgsSchema = z.object({
   event: z.string().min(1).max(80),
   component: z.string().optional().default('file_preview'),
@@ -314,6 +331,7 @@ export const toolArgSchemas: Record<string, z.ZodTypeAny> = {
   kill_process: KillProcessArgsSchema,
   get_usage_stats: GetUsageStatsArgsSchema,
   get_recent_tool_calls: GetRecentToolCallsArgsSchema,
+  get_recent_anomalies: GetRecentAnomaliesArgsSchema,
   give_feedback_to_desktop_commander: GiveFeedbackArgsSchema,
   get_prompts: GetPromptsArgsSchema,
   track_ui_event: TrackUiEventArgsSchema,
