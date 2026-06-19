@@ -201,6 +201,11 @@ export const InteractWithProcessArgsSchema = z.object({
   timeout_ms: z.number().optional(),
   wait_for_prompt: z.boolean().optional(),
   verbose_timing: z.boolean().optional(),
+  // When true (default) the input is followed by a newline, like pressing
+  // Enter. Set false to send raw bytes — useful for: single-key menu pickers
+  // ("y" / "n" / "1"), control characters ("\u0003" = Ctrl+C, "\u0004" = EOF),
+  // or any prompt that reads one char without waiting for Enter.
+  append_newline: z.boolean().optional().default(true),
 });
 
 // Usage stats schema

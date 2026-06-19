@@ -482,7 +482,8 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
     input,
     timeout_ms = 8000,
     wait_for_prompt = true,
-    verbose_timing = false
+    verbose_timing = false,
+    append_newline = true
   } = parsed.data;
 
   // Get config for output line limit
@@ -520,7 +521,7 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
     // This handles REPLs where output is appended to the prompt line
     const outputSnapshot = terminalManager.captureOutputSnapshot(pid);
 
-    const success = terminalManager.sendInputToProcess(pid, input);
+    const success = terminalManager.sendInputToProcess(pid, input, append_newline);
 
     if (!success) {
       return {
@@ -582,6 +583,24 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
         // Fast-polling check - check every 50ms for quick responses
         interval = setInterval(() => {
           if (resolved) return;
+
+          // FAST PATH: process exited between polls — flush any final output
+          // and resolve immediately. Without this, a command that prints
+          // "done." then exits sits in the loop until timeout_ms because
+          // analyzeProcessState's text-based isFinished heuristic doesn't
+          // know about real process lifecycle.
+          if (!terminalManager.getSession(pid)) {
+            const flush = outputSnapshot
+              ? terminalManager.getOutputSinceSnapshot(pid, outputSnapshot)
+              : terminalManager.getNewOutput(pid);
+            if (flush && flush.length > lastOutputLength) {
+              output = flush;
+              lastOutputLength = flush.length;
+            }
+            exitReason = 'process_finished';
+            resolveOnce();
+            return;
+          }
 
           // Use snapshot-based reading to handle REPL prompt line appending
           const newOutput = outputSnapshot 

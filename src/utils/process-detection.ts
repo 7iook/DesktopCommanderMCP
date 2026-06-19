@@ -24,6 +24,40 @@ const REPL_PROMPTS = {
   mongo: ['> ', '... ']
 };
 
+/**
+ * Application-level prompt patterns. Triggered ONLY when the cursor is parked
+ * on a partial line (output doesn't end with newline) — this is the strongest
+ * "we are blocked on input" signal. Without the partial-line gate these
+ * patterns would false-match on regular log output ("INFO: starting up\n").
+ *
+ * Covers the practical universe of CLI prompts AI agents encounter:
+ *   - Word-prefix-then-colon:  "Enter X: ", "Password: ", "Choice: "
+ *   - Yes/no choices:          "(y/n) ", "(y/N) ", "[Y/n] "
+ *   - Generic colon-end:       "Anything: " on a partial line
+ *   - Generic question-end:    "Anything? " on a partial line
+ *   - Chinese:                 "请输入...:" / "请选择...:" / "确认...?"
+ *   - Continuation prompts:    "Press ... to continue"
+ *   - Bracket-style picker:    "(1/2/3): " or "[1-9]: "
+ *
+ * The shell prompt characters (`>` `#` `$` `%`) on partial lines are also
+ * covered separately by REPL_PROMPTS / quickPromptPatterns elsewhere.
+ */
+const APP_PROMPT_PATTERNS: RegExp[] = [
+  // Word + ":" (English)
+  /\b(enter|input|select|choose|choice|password|username|user|name|email|address|key|number|value|filename|path|url|host|port|version|continue|press|confirm|yes|no|y\/n|y\/n\?|option|action|command|step|stage|phase)\b[^\n]*[:?]\s*$/i,
+  // Yes/no inline picker — "(y/n)" / "[Y/n]" / "(yes/no)"
+  /[\(\[]\s*[YyNn](?:es|o)?\s*[\/|]\s*[YyNn](?:es|o)?\s*[\)\]]\s*[:?]?\s*$/,
+  // Numeric/letter choice picker — "(1/2/3)", "[a-z]"
+  /[\(\[][0-9A-Za-z](?:[\/|\-,][0-9A-Za-z])+[\)\]]\s*[:?]?\s*$/,
+  // Chinese application prompts
+  /(?:请[\s\S]{0,15}(?:输入|选择|确认|提供|填写|回答)|输入|选择)[^\n]*[:：?？]\s*$/,
+  // "Press <X> to continue" / "Press any key"
+  /press\s+(?:any\s+)?\S+\s+(?:to|key)[^\n]*$/i,
+  // Generic colon-end on partial line: "Foo: " — last-resort, kept narrow by
+  // requiring at least one letter before the colon and excluding URLs.
+  /(?<!:\/\/[^\s]*)\b\w[\w\-\s.]*\w[:：]\s*$/,
+];
+
 // Error patterns that indicate completion (even with errors)
 const ERROR_COMPLETION_PATTERNS = [
   /Error:/i,
@@ -65,9 +99,14 @@ export function analyzeProcessState(output: string, pid?: number): ProcessState 
   const lastLine = lines[lines.length - 1] || '';
   const lastFewLines = lines.slice(-3).join('\n');
 
+  // Cursor is parked on the last line iff output doesn't end with newline.
+  // This is the strong signal that distinguishes "blocked on prompt" from
+  // "still printing log lines". App-level prompt patterns only match here.
+  const cursorOnPartialLine = !output.endsWith('\n') && lastLine.length > 0;
+
   // Check for REPL prompts (waiting for input)
   const allPrompts = Object.values(REPL_PROMPTS).flat();
-  const detectedPrompt = allPrompts.find(prompt => 
+  const detectedPrompt = allPrompts.find(prompt =>
     lastLine.endsWith(prompt) || lastLine.includes(prompt)
   );
 
@@ -79,6 +118,21 @@ export function analyzeProcessState(output: string, pid?: number): ProcessState 
       detectedPrompt,
       lastOutput: output
     };
+  }
+
+  // Application-level prompt detection — only when cursor is on a partial line.
+  if (cursorOnPartialLine) {
+    for (const pat of APP_PROMPT_PATTERNS) {
+      if (pat.test(lastLine)) {
+        return {
+          isWaitingForInput: true,
+          isFinished: false,
+          isRunning: true,
+          detectedPrompt: lastLine.slice(-Math.min(60, lastLine.length)),
+          lastOutput: output
+        };
+      }
+    }
   }
 
   // Check for completion indicators

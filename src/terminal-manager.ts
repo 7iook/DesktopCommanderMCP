@@ -252,19 +252,26 @@ export class TerminalManager {
    * Send input to a running process
    * @param pid Process ID
    * @param input Text to send to the process
+   * @param appendNewline When true (default), append '\n' if the input
+   *   doesn't already end with one. Set false to send raw bytes verbatim
+   *   (single-key menu pickers, control chars like \u0003 Ctrl+C / \u0004 EOF).
    * @returns Whether input was successfully sent
    */
-  sendInputToProcess(pid: number, input: string): boolean {
+  sendInputToProcess(pid: number, input: string, appendNewline: boolean = true): boolean {
     const session = this.sessions.get(pid);
     if (!session) {
       return false;
     }
-    
+
     try {
       if (session.process.stdin && !session.process.stdin.destroyed) {
-        // Ensure input ends with a newline for most REPLs
-        const inputWithNewline = input.endsWith('\n') ? input : input + '\n';
-        session.process.stdin.write(inputWithNewline);
+        // Add a trailing newline only when the caller wants line-buffered
+        // input (most prompts). Raw mode (appendNewline=false) is required
+        // for control characters and single-key REPL-style readers.
+        const finalInput = appendNewline && !input.endsWith('\n') && !input.endsWith('\r\n')
+          ? input + '\n'
+          : input;
+        session.process.stdin.write(finalInput);
         return true;
       }
       return false;
