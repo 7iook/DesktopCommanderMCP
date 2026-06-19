@@ -60,12 +60,58 @@ function detectEncoding(headBuf: Buffer): InspectFileResult['encoding'] {
     return 'utf-8';
 }
 
-function safeUtf8Slice(buf: Buffer, maxChars: number): string {
-    // Buffer.toString may produce a replacement char if cut mid-codepoint.
-    // For preview purposes this is acceptable; we just truncate by char count.
-    const s = buf.toString('utf8');
+/**
+ * Trim incomplete UTF-8 byte sequences at the edges of a buffer that was
+ * cut at an arbitrary byte boundary (head/tail sample, paginated read).
+ *
+ * Without this, decoding a buffer whose start splits a 3-byte CJK character
+ * produces leading 0xFFFD replacement characters ("�") — confusing AI agents
+ * into thinking the file is in the wrong encoding (real-world report:
+ * E:\reverse-refs\oebb\.log tailPreview showed "��有的连接" and an AI
+ * concluded the file was GBK, when in fact it was clean UTF-8 with our
+ * preview boundary slicing the 3-byte "所" character.)
+ *
+ * UTF-8 byte classification:
+ *   0x00-0x7F → ASCII (single byte, complete)
+ *   0x80-0xBF → continuation byte (must follow a lead)
+ *   0xC0-0xDF → 2-byte lead (1 continuation expected)
+ *   0xE0-0xEF → 3-byte lead (2 continuations expected)
+ *   0xF0-0xF7 → 4-byte lead (3 continuations expected)
+ */
+function trimIncompleteUtf8Edges(buf: Buffer): Buffer {
+    let start = 0;
+    let end = buf.length;
+    // Trim orphan continuation bytes at the start (lead byte got cut off
+    // before our slice began).
+    while (start < end && (buf[start] & 0xC0) === 0x80) start++;
+    // Trim a dangling lead at the end whose continuation bytes weren't
+    // captured by our slice. Walk back at most 4 bytes looking for a lead.
+    for (let i = 1; i <= 4 && end - i >= start; i++) {
+        const b = buf[end - i];
+        if ((b & 0x80) === 0) break;            // ASCII byte → all complete
+        if ((b & 0xC0) === 0xC0) {
+            // Lead byte found i bytes from end; how many continuations expected?
+            let expected = 0;
+            if ((b & 0xE0) === 0xC0) expected = 2;
+            else if ((b & 0xF0) === 0xE0) expected = 3;
+            else if ((b & 0xF8) === 0xF0) expected = 4;
+            else break;                          // invalid lead, leave alone
+            if (i < expected) end -= i;          // dangling — trim
+            break;
+        }
+        // Continuation byte; keep walking back to find its lead.
+    }
+    return start > 0 || end < buf.length ? buf.slice(start, end) : buf;
+}
+
+function safeUtf8Slice(buf: Buffer, maxChars: number, fromTail = false): string {
+    // Trim incomplete UTF-8 edges first so toString('utf8') doesn't emit
+    // leading/trailing 0xFFFD replacement chars from a sub-buffer that cut
+    // a multi-byte sequence in half.
+    const trimmed = trimIncompleteUtf8Edges(buf);
+    const s = trimmed.toString('utf8');
     if (s.length <= maxChars) return s;
-    return s.slice(0, maxChars);
+    return fromTail ? s.slice(s.length - maxChars) : s.slice(0, maxChars);
 }
 
 function countLinesAndLongestLine(buf: Buffer): { lines: number; longest: number } {
@@ -212,10 +258,10 @@ export async function inspectFile(filePath: string): Promise<InspectFileResult> 
 
     const headPreview = isBinary
         ? `<binary; first ${headBuf.length} bytes hex: ${headBuf.slice(0, 32).toString('hex')}...>`
-        : safeUtf8Slice(headBuf, PREVIEW_TEXT_CHARS);
+        : safeUtf8Slice(headBuf, PREVIEW_TEXT_CHARS, false);
     const tailPreview = isBinary
         ? `<binary; last bytes hex: ${tailBuf.slice(-32).toString('hex')}>`
-        : safeUtf8Slice(tailBuf.slice(-PREVIEW_TEXT_CHARS * 4), PREVIEW_TEXT_CHARS);
+        : safeUtf8Slice(tailBuf, PREVIEW_TEXT_CHARS, true);
 
     // Recommendation
     let recommendation: string;
