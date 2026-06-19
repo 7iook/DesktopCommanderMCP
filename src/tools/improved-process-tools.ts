@@ -286,13 +286,18 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
   // a false positive.
   const PS_NESTED_WRAPPER = /^\s*(?:powershell|pwsh)(?:\.exe)?\s+(?:-\w+\s+)*-c(?:ommand)?\s+"/i;
   // Detect another common Windows trap: `cmd /c timeout /t N` (or bare
-  // `timeout /t N`). timeout.exe needs a real console handle that
-  // desktop-commander's piped stdio shell does NOT provide, so it bails
-  // out immediately with "ERROR: Input redirection is not supported" and
-  // any commands chained after it run with zero wait — the equivalent of
-  // `Start-Sleep` not happening at all. Only a recommendation; we do not
-  // rewrite the command.
-  const CMD_TIMEOUT_TRAP = /(?:^|[\s&|;])(?:cmd(?:\.exe)?\s+\/c\s+)?timeout(?:\.exe)?\s+\/t\s+\d+/i;
+  // `timeout /t N`, or `cmd /c "timeout /t N ..."`). timeout.exe needs a
+  // real console handle that desktop-commander's piped stdio shell does
+  // NOT provide, so it bails out immediately with "ERROR: Input
+  // redirection is not supported" and any commands chained after it run
+  // with zero wait — the equivalent of `Start-Sleep` not happening at
+  // all. Only a recommendation; we do not rewrite the command.
+  // \b matches a word boundary before `timeout`, so it fires whether the
+  // preceding char is whitespace, `"`, `'`, `&`, `|`, `;`, or string
+  // start. Trailing `\s+/t\s+\d+` keeps the hint scoped to the actual
+  // trap (timeout WITH /t flag) rather than incidental "timeout" tokens
+  // in paths or other commands.
+  const CMD_TIMEOUT_TRAP = /\btimeout(?:\.exe)?\s+\/t\s+\d+/i;
   let antiPatternHint = '';
   if (PS_NESTED_WRAPPER.test(commandToRun) && /\$[_\w:]/.test(commandToRun)) {
     antiPatternHint =
