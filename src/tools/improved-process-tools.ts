@@ -768,18 +768,29 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
               return;
             }
 
-            // Also exit if process finished. In long-running mode, double-check
-            // with the OS — long batches frequently print things that match the
-            // text-based COMPLETION_INDICATORS / ERROR_COMPLETION_PATTERNS
-            // ("Error:", "Exception:", a full stack trace from one failing
-            // worker) without the parent process actually having exited.
-            // Trusting the text alone made interact_with_process say
-            // ✅ finished mid-batch and callers moved on prematurely.
+            // Also exit if process finished. text-based isFinished is set by
+            // analyzeProcessState when the output matches COMPLETION_INDICATORS
+            // ("Process finished", "Exit code:", ...) or ERROR_COMPLETION_PATTERNS
+            // ("Error:", "Exception:", "Traceback", a Node stack trace, ...).
+            // In long batch jobs (test suites, browser automation, trial harnesses)
+            // a single failing worker frequently prints stack traces while the
+            // parent is still running — trusting that text alone made
+            // interact_with_process say ✅ finished mid-batch and callers moved
+            // on prematurely.
+            //
+            // OS-level liveness is the baseline defense, NOT a long-running
+            // specialty: even default callers should not be lied to. We always
+            // verify with isPidAlive() before honoring text-based isFinished.
+            // expect_long_running is preserved as a stricter posture (e.g. OS
+            // unknown / EPERM still treated as alive) but the default already
+            // gets the OS sanity check — same root cause, two failure modes,
+            // unified fix per the sweep-the-class principle.
             if (processState.isFinished) {
-              if (expect_long_running && isPidAlive(pid)) {
-                // Text says done, but OS says PID is still alive AND user
-                // explicitly opted into long-running mode. Treat the text
-                // signal as a transient log line, not a real completion.
+              if (isPidAlive(pid)) {
+                // Text said done, but OS says PID is still alive. Treat the
+                // text signal as a transient log line, not a real completion.
+                // Drop back into the polling loop so we either pick up a real
+                // prompt / actual finish later or hit timeout cleanly.
                 processState.isFinished = false;
                 processState.isRunning = true;
               } else {
