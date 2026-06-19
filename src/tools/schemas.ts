@@ -83,6 +83,22 @@ export const WriteFileArgsSchema = z.object({
   allowOverwrite: z.boolean().optional().default(false),
 });
 
+// Batch write: create/append multiple files in ONE tool call. The real
+// bottleneck for "AI scaffolds N files" is N MCP round-trips, not disk I/O
+// (7MB writes in ~80ms). This collapses N round-trips to 1. Each entry runs
+// through the same writeFile path (per-path mutex + auto-mkdir + overwrite
+// protection); failures are reported per-file, not aborted as a batch
+// (no cross-file filesystem transaction exists — pretending otherwise is
+// more dangerous than honest partial success).
+export const WriteMultipleFilesArgsSchema = z.object({
+  files: z.array(z.object({
+    path: z.string(),
+    content: z.string(),
+    mode: z.enum(['rewrite', 'append']).optional().default('rewrite'),
+    allowOverwrite: z.boolean().optional().default(false),
+  })).min(1),
+});
+
 // PDF modification schemas - exported for reuse
 export const PdfInsertOperationSchema = z.object({
   type: z.literal('insert'),
@@ -259,6 +275,7 @@ export const toolArgSchemas: Record<string, z.ZodTypeAny> = {
   read_file: ReadFileArgsSchema,
   read_multiple_files: ReadMultipleFilesArgsSchema,
   write_file: WriteFileArgsSchema,
+  write_multiple_files: WriteMultipleFilesArgsSchema,
   write_pdf: WritePdfArgsSchema,
   create_directory: CreateDirectoryArgsSchema,
   list_directory: ListDirectoryArgsSchema,

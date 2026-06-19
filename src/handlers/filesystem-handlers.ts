@@ -24,6 +24,7 @@ import {
     ReadFileArgsSchema,
     ReadMultipleFilesArgsSchema,
     WriteFileArgsSchema,
+    WriteMultipleFilesArgsSchema,
     CreateDirectoryArgsSchema,
     ListDirectoryArgsSchema,
     MoveFileArgsSchema,
@@ -290,6 +291,59 @@ export async function handleReadMultipleFiles(args: unknown): Promise<ServerResu
 }
 
 /**
+ * Single write entry shared by write_file and write_multiple_files.
+ * Applies overwrite protection + line-limit notice, delegates the actual
+ * write to writeFile() (which owns per-path mutex + auto-mkdir). Returns a
+ * structured result so the batch handler can report per-file outcomes.
+ */
+interface WriteEntry {
+    path: string;
+    content: string;
+    mode: 'rewrite' | 'append';
+    allowOverwrite: boolean;
+}
+interface WriteOutcome {
+    path: string;
+    ok: boolean;
+    mode: 'rewrite' | 'append';
+    lineCount?: number;
+    note?: string;   // e.g. oversized-write performance tip
+    error?: string;
+}
+
+async function writeOneFile(entry: WriteEntry, protectionEnabled: boolean, maxLines: number): Promise<WriteOutcome> {
+    // Overwrite protection: rewrite of an existing file requires allowOverwrite.
+    if (entry.mode === 'rewrite' && !entry.allowOverwrite && protectionEnabled) {
+        const resolvedCheckPath = resolveAbsolutePath(entry.path);
+        try {
+            const stat = await fs.stat(resolvedCheckPath);
+            if (stat.isFile()) {
+                return {
+                    path: entry.path, ok: false, mode: entry.mode,
+                    error: `File already exists (${stat.size} bytes); rewrite would overwrite it. Use edit_block, mode:'append', or allowOverwrite:true.`
+                };
+            }
+        } catch (err: any) {
+            if (err && err.code !== 'ENOENT') {
+                return { path: entry.path, ok: false, mode: entry.mode, error: err.message };
+            }
+            // ENOENT: new file, safe to write.
+        }
+    }
+
+    const lineCount = entry.content.split('\n').length;
+    try {
+        await writeFile(entry.path, entry.content, entry.mode);
+    } catch (err: any) {
+        return { path: entry.path, ok: false, mode: entry.mode, error: err instanceof Error ? err.message : String(err) };
+    }
+    const note = lineCount > maxLines
+        ? `large write (${lineCount} lines); consider ≤30-line chunks for future edits`
+        : undefined;
+    return { path: entry.path, ok: true, mode: entry.mode, lineCount, note };
+}
+
+/**
  * Handle write_file command
  */
 export async function handleWriteFile(args: unknown): Promise<ServerResult> {
@@ -299,21 +353,20 @@ export async function handleWriteFile(args: unknown): Promise<ServerResult> {
         // Get the line limit from configuration
         const config = await configManager.getConfig();
         const MAX_LINES = config.fileWriteLineLimit ?? 50; // Default to 50 if not set
-
-        // Overwrite protection: when mode='rewrite' and target file already
-        // exists, refuse unless allowOverwrite=true. Prevents silent full-file
-        // overwrites by AI clients that ignore prompt-level rules ("use
-        // edit_block / append"). Tightens user-rule §3 from policy to code.
-        // Set writeFileOverwriteProtection=false to restore legacy behavior.
         const protectionEnabled = config.writeFileOverwriteProtection !== false;
-        if (parsed.mode === 'rewrite' && !parsed.allowOverwrite && protectionEnabled) {
-            const resolvedCheckPath = resolveAbsolutePath(parsed.path);
-            try {
-                const stat = await fs.stat(resolvedCheckPath);
-                if (stat.isFile()) {
-                    return createErrorResponse(
+
+        const outcome = await writeOneFile(
+            { path: parsed.path, content: parsed.content, mode: parsed.mode, allowOverwrite: parsed.allowOverwrite },
+            protectionEnabled,
+            MAX_LINES
+        );
+
+        if (!outcome.ok) {
+            // Preserve the rich guidance message for the single-file overwrite case.
+            if (outcome.error && outcome.error.startsWith('File already exists')) {
+                return createErrorResponse(
 `⚠️ File already exists: ${parsed.path}
-write_file with mode='rewrite' would OVERWRITE the entire file (${stat.size} bytes).
+write_file with mode='rewrite' would OVERWRITE the entire file.
 
 Choose one:
   • Surgical edit (recommended) → use edit_block with old_string + new_string
@@ -322,35 +375,21 @@ Choose one:
 
 Disable this guard globally:
   set_config_value("writeFileOverwriteProtection", false)`
-                    );
-                }
-            } catch (err: any) {
-                if (err && err.code !== 'ENOENT') throw err;
-                // ENOENT: file doesn't exist; rewrite is safe (creating new file).
+                );
             }
+            return createErrorResponse(outcome.error || 'Write failed');
         }
 
-        // Strictly enforce line count limit
-        const lines = parsed.content.split('\n');
-        const lineCount = lines.length;
-        let errorMessage = "";
-        if (lineCount > MAX_LINES) {
-            errorMessage = `✅ File written successfully! (${lineCount} lines)
-            
-💡 Performance tip: For optimal speed, consider chunking files into ≤30 line pieces in future operations.`;
-        }
-
-        // Pass the mode parameter to writeFile
-        await writeFile(parsed.path, parsed.content, parsed.mode);
-
-        // Provide more informative message based on mode
         const modeMessage = parsed.mode === 'append' ? 'appended to' : 'wrote to';
         const resolvedWritePath = resolveAbsolutePath(parsed.path);
+        const tip = outcome.note
+            ? `\n\n💡 Performance tip: For optimal speed, consider chunking files into ≤30 line pieces in future operations.`
+            : '';
 
         return {
             content: [{
                 type: "text",
-                text: `Successfully ${modeMessage} ${parsed.path} (${lineCount} lines) ${errorMessage}`
+                text: `Successfully ${modeMessage} ${parsed.path} (${outcome.lineCount} lines)${tip}`
             }],
             structuredContent: {
                 fileName: path.basename(resolvedWritePath),
@@ -359,6 +398,61 @@ Disable this guard globally:
                 sourceTool: 'write_file',
                 ...await getDefaultEditorMetadata(resolvedWritePath),
             },
+        };
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return createErrorResponse(errorMessage);
+    }
+}
+
+/**
+ * Handle write_multiple_files command — batch create/append in one call.
+ *
+ * Collapses N MCP round-trips into 1 (the actual bottleneck for scaffolding;
+ * disk I/O is ~80ms even for 7MB). Different files run concurrently
+ * (Promise.all); same-path entries are auto-serialized by writeFile's
+ * per-path mutex. Per-file outcomes are reported independently — a failure
+ * in one file never aborts the others (there's no cross-file FS transaction).
+ */
+export async function handleWriteMultipleFiles(args: unknown): Promise<ServerResult> {
+    try {
+        const parsed = WriteMultipleFilesArgsSchema.parse(args);
+        const config = await configManager.getConfig();
+        const MAX_LINES = config.fileWriteLineLimit ?? 50;
+        const protectionEnabled = config.writeFileOverwriteProtection !== false;
+
+        const outcomes = await Promise.all(
+            parsed.files.map(f => writeOneFile(
+                { path: f.path, content: f.content, mode: f.mode, allowOverwrite: f.allowOverwrite },
+                protectionEnabled,
+                MAX_LINES
+            ))
+        );
+
+        const okCount = outcomes.filter(o => o.ok).length;
+        const failCount = outcomes.length - okCount;
+        const lines = outcomes.map(o => {
+            if (o.ok) {
+                const noteSuffix = o.note ? ` — ${o.note}` : '';
+                return `✅ ${o.mode === 'append' ? 'appended' : 'wrote'} ${o.path} (${o.lineCount} lines)${noteSuffix}`;
+            }
+            return `❌ ${o.path} — ${o.error}`;
+        });
+        const summary = `Batch write: ${okCount} succeeded, ${failCount} failed (of ${outcomes.length}).`;
+
+        return {
+            content: [{
+                type: "text",
+                text: `${summary}\n${lines.join('\n')}`
+            }],
+            structuredContent: {
+                sourceTool: 'write_multiple_files',
+                total: outcomes.length,
+                succeeded: okCount,
+                failed: failCount,
+                results: outcomes,
+            },
+            isError: failCount > 0 && okCount === 0,  // hard error only if ALL failed
         };
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);

@@ -33,6 +33,7 @@ import {
     ReadFileArgsSchema,
     ReadMultipleFilesArgsSchema,
     WriteFileArgsSchema,
+    WriteMultipleFilesArgsSchema,
     CreateDirectoryArgsSchema,
     ListDirectoryArgsSchema,
     MoveFileArgsSchema,
@@ -434,6 +435,42 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 _meta: buildUiToolMeta(FILE_PREVIEW_RESOURCE_URI, true, showMcpUiPreviews),
                 annotations: {
                     title: "Write File",
+                    readOnlyHint: false,
+                    destructiveHint: true,
+                    openWorldHint: false,
+                },
+            },
+            {
+                name: "write_multiple_files",
+                description: `
+                        Create or append MULTIPLE files in a SINGLE call.
+
+                        Use this instead of many sequential write_file calls when scaffolding a
+                        project or generating several related files. The real cost of writing N
+                        files is N MCP round-trips (each one a full model turn), not disk I/O —
+                        this collapses them into one.
+
+                        Input: { files: [ { path, content, mode?, allowOverwrite? }, ... ] }
+                        - mode: "rewrite" (default) or "append"
+                        - allowOverwrite: required to rewrite an existing file (same overwrite
+                          protection as write_file)
+
+                        Behavior:
+                        - Different files are written concurrently; same-path entries are
+                          serialized automatically (per-path mutex, no lost updates).
+                        - Parent directories are auto-created (mkdir -p) for every entry.
+                        - Each file's outcome is reported independently. A failure in one file
+                          does NOT abort the others (no cross-file transaction). The response
+                          lists per-file ✅/❌ plus a summary count.
+
+                        For a single file, prefer write_file. For surgical edits to existing
+                        files, prefer edit_block.
+
+                        ${PATH_GUIDANCE}
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(WriteMultipleFilesArgsSchema),
+                annotations: {
+                    title: "Write Multiple Files",
                     readOnlyHint: false,
                     destructiveHint: true,
                     openWorldHint: false,
@@ -1440,6 +1477,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
             case "write_file":
                 result = await handlers.handleWriteFile(args);
+                break;
+
+            case "write_multiple_files":
+                result = await handlers.handleWriteMultipleFiles(args);
                 break;
 
             case "write_pdf":
