@@ -234,9 +234,38 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
     parsed.data.env
   );
 
+  // Detect a recurring AI anti-pattern: nesting `powershell -Command "..."`
+  // (or `pwsh -Command "..."`) inside a command that is ALREADY going to run
+  // through a PowerShell shell. The outer shell expands $_ / $env:* / $var
+  // INSIDE the double-quoted argument before handing the string to the inner
+  // powershell, so `$_.Name` becomes `.Name` and the inner command fails with
+  // mass "The term '.Name' is not recognized" errors.
+  //
+  // We don't auto-strip the wrapper — silent rewriting of user commands is
+  // worse than the original bug — but we do flag it so the AI doesn't go off
+  // building a .ps1 workaround thinking the transport layer ate $_ (it didn't;
+  // commit 14321fc fixed transport-level $_ swallowing via -EncodedCommand).
+  // Match only DOUBLE-quoted nested wrapper. Single-quoted wrappers
+  // (`powershell -Command '...'`) don't expand $_ and run correctly even
+  // though the wrapper itself is unnecessary — flagging those would be
+  // a false positive.
+  const PS_NESTED_WRAPPER = /^\s*(?:powershell|pwsh)(?:\.exe)?\s+(?:-\w+\s+)*-c(?:ommand)?\s+"/i;
+  let antiPatternHint = '';
+  if (PS_NESTED_WRAPPER.test(commandToRun) && /\$[_\w:]/.test(commandToRun)) {
+    antiPatternHint =
+      `\n\n⚠️ Possible anti-pattern detected: nested \`powershell/pwsh -Command "..."\` wrapper containing $variables.\n` +
+      `desktop-commander already runs your command in a PowerShell shell. The OUTER shell expands\n` +
+      `$_ / $env:* / $var inside the double-quoted argument BEFORE passing the string to the inner\n` +
+      `powershell — that's why $_.Name becomes .Name and the inner pipeline fails.\n` +
+      `Fix: drop the wrapper. (transport-level $_ swallowing was already fixed in commit 14321fc;\n` +
+      `you don't need a temp .ps1 workaround unless the command genuinely requires it.)\n` +
+      `  Bad:  powershell -Command "Get-Process | %{ $_.Name }"\n` +
+      `  Good: Get-Process | %{ $_.Name }\n`;
+  }
+
   if (result.pid === -1) {
     return {
-      content: [{ type: "text", text: result.output }],
+      content: [{ type: "text", text: result.output + antiPatternHint }],
       isError: true,
     };
   }
@@ -273,7 +302,7 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
   return {
     content: [{
       type: "text",
-      text: `Process started with PID ${result.pid} (shell: ${shellUsed})\nInitial output:\n${cappedOutput}${statusMessage}${timingMessage}`
+      text: `Process started with PID ${result.pid} (shell: ${shellUsed})\nInitial output:\n${cappedOutput}${statusMessage}${timingMessage}${antiPatternHint}`
     }],
   };
 }
