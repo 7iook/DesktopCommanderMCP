@@ -59,3 +59,6 @@ test_fix.js
 test_search.js
 .ripgrep-downloads/
 .ace-tool/
+
+# AI agent workspace (RCA / decision cards / scratch — never publish)
+.agent-workspace/
