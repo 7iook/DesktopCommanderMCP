@@ -718,50 +718,14 @@ export async function createDirectory(dirPath: string): Promise<void> {
     await fs.mkdir(validPath, { recursive: true });
 }
 
-// Global bounds for listDirectory's recursive walk. Without these a single
-// list_directory call on a huge/slow tree (drive root, node_modules, cloud
-// placeholder dirs, junction loops, depth>=2 megatrees) accumulates every
-// entry into memory and runs for minutes — long enough to blow the MCP client
-// request timeout (mcphub: 300000ms -> -32001) and, near OOM, freeze the
-// process. The per-nested-dir MAX_NESTED_ITEMS cap does NOT bound the top
-// level or the total, and the handler's char cap only trims the FINAL string
-// after the expensive walk. These two ceilings make the walk terminate
-// predictably; list_multiple_directories (concurrent walks) relies on them too.
-const DEFAULT_MAX_TOTAL_ENTRIES = 20000;
-const DEFAULT_LIST_TIME_BUDGET_MS = 15000;
-
-export async function listDirectory(
-    dirPath: string,
-    depth: number = 2,
-    opts: { maxEntries?: number; timeBudgetMs?: number } = {}
-): Promise<string[]> {
+export async function listDirectory(dirPath: string, depth: number = 2): Promise<string[]> {
     const validPath = await validatePath(dirPath);
     const results: string[] = [];
 
     const MAX_NESTED_ITEMS = 100; // Maximum items to show per nested directory
-    const maxEntries = opts.maxEntries ?? DEFAULT_MAX_TOTAL_ENTRIES;
-    const timeBudgetMs = opts.timeBudgetMs ?? DEFAULT_LIST_TIME_BUDGET_MS;
-    const startTime = Date.now();
-    let stopped = false;
-
-    // Returns true once a global bound (total entries or wall-clock budget) is
-    // hit, appending a single [TRUNCATED] marker so the recursion unwinds
-    // instead of hanging. Idempotent: the marker is pushed only once.
-    function boundHit(): boolean {
-        if (stopped) return true;
-        let reason = '';
-        if (results.length >= maxEntries) reason = `entry cap ${maxEntries}`;
-        else if (Date.now() - startTime >= timeBudgetMs) reason = `time budget ${timeBudgetMs}ms`;
-        if (reason) {
-            stopped = true;
-            results.push(`[TRUNCATED] directory listing stopped early (${reason} reached) — narrow the path or reduce depth to see the rest`);
-        }
-        return stopped;
-    }
 
     async function listRecursive(currentPath: string, currentDepth: number, relativePath: string = '', isTopLevel: boolean = true): Promise<void> {
         if (currentDepth <= 0) return;
-        if (boundHit()) return;
 
         let entries;
         try {
@@ -791,7 +755,6 @@ export async function listDirectory(
         }
 
         for (const entry of entriesToShow) {
-            if (boundHit()) return;
             const fullPath = path.join(currentPath, entry.name);
             const displayPath = relativePath ? path.join(relativePath, entry.name) : entry.name;
 
@@ -813,7 +776,7 @@ export async function listDirectory(
         }
 
         // Add warning message if items were filtered
-        if (filteredCount > 0 && !stopped) {
+        if (filteredCount > 0) {
             const displayPath = relativePath || path.basename(currentPath);
             results.push(`[WARNING] ${displayPath}: ${filteredCount} items hidden (showing first ${MAX_NESTED_ITEMS} of ${totalEntries} total)`);
         }
