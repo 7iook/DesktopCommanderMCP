@@ -24,6 +24,13 @@ export interface TerminalSession {
   bufferedChars: number;      // Joined length of outputLines (content + separators)
   evictedLines: number;       // Lines dropped from the front to enforce the buffer cap
   evictedChars: number;       // Joined length of evicted lines (keeps snapshot offsets absolute)
+  // PowerShell CLIXML scrubbing (Windows PS 5.1 emits a "#< CLIXML ...<Objs>"
+  // envelope on stderr even with -OutputFormat Text). When true, raw chunks are
+  // filtered at the write boundary before entering outputLines so the ring
+  // buffer is a single clean source for all readers.
+  stripCliXml?: boolean;
+  // Carry for an incomplete CLIXML construct split across stdout/stderr chunks.
+  cliXmlCarry?: string;
 }
 
 export interface CommandExecutionResult {

@@ -402,7 +402,9 @@ export class TerminalManager {
       startTime: new Date(),
       bufferedChars: 0,
       evictedLines: 0,
-      evictedChars: 0
+      evictedChars: 0,
+      stripCliXml: spawnConfig.stripCliXml === true,
+      cliXmlCarry: ''
     };
 
     this.sessions.set(childProcess.pid, session);
@@ -469,8 +471,8 @@ export class TerminalManager {
             output = output.slice(-Math.floor(MAX_WAIT_OUTPUT_CHARS / 2));
           }
         }
-        // Append to line-based buffer
-        this.appendToLineBuffer(session, text);
+        // Append to line-based buffer (CLIXML-filtered at the boundary for PS)
+        this.appendToLineBuffer(session, this.filterCliXmlStream(session, text));
 
         // Record output event if collecting timing
         if (collectTiming) {
@@ -513,8 +515,8 @@ export class TerminalManager {
             output = output.slice(-Math.floor(MAX_WAIT_OUTPUT_CHARS / 2));
           }
         }
-        // Append to line-based buffer
-        this.appendToLineBuffer(session, text);
+        // Append to line-based buffer (CLIXML-filtered at the boundary for PS)
+        this.appendToLineBuffer(session, this.filterCliXmlStream(session, text));
 
         // Record output event if collecting timing
         if (collectTiming) {
@@ -557,6 +559,15 @@ export class TerminalManager {
 
       childProcess.on('exit', (code: any) => {
         if (childProcess.pid) {
+          // Flush any carried-but-incomplete CLIXML fragment. Run it through
+          // the block stripper once more (recovers real text that was carried
+          // on a false positive); genuine dangling noise is near-impossible
+          // since CLIXML envelopes are well-formed and contiguous.
+          if (session.cliXmlCarry) {
+            const leftover = stripPsCliXml(session.cliXmlCarry);
+            session.cliXmlCarry = '';
+            if (leftover) this.appendToLineBuffer(session, leftover);
+          }
           // Store completed session before removing active session
           this.completedSessions.set(childProcess.pid, {
             pid: childProcess.pid,
@@ -584,6 +595,80 @@ export class TerminalManager {
         });
       });
     });
+  }
+
+  /**
+   * Streaming CLIXML filter for PowerShell sessions, applied at the write
+   * boundary (before appendToLineBuffer) so the ring buffer is the single
+   * clean source of truth for every reader (read_process_output, snapshots,
+   * getNewOutput, interact_with_process_lines).
+   *
+   * PS 5.1 emits a `#< CLIXML\r\n<Objs ...>...</Objs>` envelope on stderr for
+   * progress/error records even with -OutputFormat Text. Previously only the
+   * wait-phase result.output was scrubbed; the raw stream still polluted the
+   * buffer AND its leading "#< CLIXML" line shifted every real line by one.
+   *
+   * Envelopes can split across stdout/stderr data chunks, so an incomplete
+   * trailing construct (a "<Objs" with no "</Objs>" yet, or a partial
+   * "#< CLIXML" header) is held in session.cliXmlCarry until the next chunk.
+   */
+  private filterCliXmlStream(session: TerminalSession, text: string): string {
+    if (!session.stripCliXml || !text) return text;
+
+    let buf = (session.cliXmlCarry ?? '') + text;
+    session.cliXmlCarry = '';
+
+    // Drop complete header markers and complete <Objs>...</Objs> blocks.
+    buf = buf
+      .replace(/#< CLIXML\r?\n/g, '')
+      .replace(/<Objs [\s\S]*?<\/Objs>/g, '');
+
+    // Carry an incomplete trailing "<Objs ..." (opened, not yet closed).
+    const openIdx = buf.lastIndexOf('<Objs');
+    if (openIdx !== -1 && buf.indexOf('</Objs>', openIdx) === -1) {
+      session.cliXmlCarry = buf.slice(openIdx);
+      buf = buf.slice(0, openIdx);
+    } else {
+      // Otherwise carry an incomplete "#< CLIXML" header (full marker without
+      // its newline yet, or a partial prefix at the very end of the chunk).
+      const carryLen = TerminalManager.trailingCliXmlHeaderFragment(buf);
+      if (carryLen > 0) {
+        session.cliXmlCarry = buf.slice(buf.length - carryLen);
+        buf = buf.slice(0, buf.length - carryLen);
+      }
+    }
+
+    // Safety valve: never let the carry grow unbounded if an assumption is
+    // wrong — flush it back rather than swallow real output or leak memory.
+    if (session.cliXmlCarry.length > 64 * 1024) {
+      buf += session.cliXmlCarry;
+      session.cliXmlCarry = '';
+    }
+    return buf;
+  }
+
+  /**
+   * Number of trailing chars of `buf` that look like the start of an
+   * unterminated "#< CLIXML" header and should be carried to the next chunk.
+   * The marker is only valid at stream start or right after a newline, which
+   * avoids false-carrying real content that merely ends with '#'.
+   */
+  private static trailingCliXmlHeaderFragment(buf: string): number {
+    const M = '#< CLIXML';
+    // Full marker present but not newline-terminated (else the regex removed
+    // it): carry from the marker onward.
+    const idx = buf.indexOf(M);
+    if (idx !== -1 && (idx === 0 || buf[idx - 1] === '\n')) {
+      return buf.length - idx;
+    }
+    // Trailing strict prefix of the marker at a line boundary.
+    for (let k = Math.min(M.length - 1, buf.length); k > 0; k--) {
+      const start = buf.length - k;
+      if (buf.slice(start) === M.slice(0, k) && (start === 0 || buf[start - 1] === '\n')) {
+        return k;
+      }
+    }
+    return 0;
   }
 
   /**
