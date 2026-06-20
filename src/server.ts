@@ -446,28 +446,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             {
                 name: "write_multiple_files",
                 description: `
-                        Create or append MULTIPLE files in a SINGLE call.
+                        Create or append MULTIPLE files in ONE call. PREFER THIS over calling
+                        write_file repeatedly.
 
-                        Use this instead of many sequential write_file calls when scaffolding a
-                        project or generating several related files. The real cost of writing N
-                        files is N MCP round-trips (each one a full model turn), not disk I/O —
-                        this collapses them into one.
+                        WHEN TO USE (default for any multi-file write):
+                        - Scaffolding a project or generating two or more related files.
+                        - Any time you are about to call write_file more than once in a row.
+                        The real cost of writing N files is N MCP round-trips (a full model turn
+                        each), not disk I/O - this collapses them into one.
 
                         Input: { files: [ { path, content, mode?, allowOverwrite? }, ... ] }
                         - mode: "rewrite" (default) or "append"
                         - allowOverwrite: required to rewrite an existing file (same overwrite
                           protection as write_file)
 
-                        Behavior:
+                        BEHAVIOR:
                         - Different files are written concurrently; same-path entries are
                           serialized automatically (per-path mutex, no lost updates).
-                        - Parent directories are auto-created (mkdir -p) for every entry.
+                        - Parent directories are auto-created for every entry.
                         - Each file's outcome is reported independently. A failure in one file
-                          does NOT abort the others (no cross-file transaction). The response
-                          lists per-file ✅/❌ plus a summary count.
+                          does NOT abort the others (no cross-file transaction); the response
+                          lists per-file success/failure plus a summary count.
 
-                        For a single file, prefer write_file. For surgical edits to existing
-                        files, prefer edit_block.
+                        For a single file, use write_file. For surgical edits to existing files,
+                        use edit_block or edit_block_multiple.
 
                         ${PATH_GUIDANCE}
                         ${CMD_PREFIX_DESCRIPTION}`,
@@ -892,30 +894,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             {
                 name: "edit_block_multiple",
                 description: `
-                        Apply MULTIPLE surgical text edits across one or many files in a SINGLE call.
-                        The batch counterpart of write_multiple_files (which does batch CREATE) — use
-                        this for batch EDIT instead of many individual edit_block round-trips.
+                        Apply MULTIPLE search/replace edits across one or many files in ONE
+                        call. PREFER THIS over calling edit_block repeatedly.
+
+                        WHEN TO USE (default for any multi-edit change):
+                        - Any time you are about to call edit_block more than once, whether the
+                          edits are in the same file or spread across several files.
+                        - Refactors, renames, or applying a reviewed list of changes to many
+                          spots at once.
+                        Each edit_block call is a full model turn; batching collapses N
+                        round-trips into one.
 
                         TYPICAL WORKFLOW:
-                        1. start_search (searchType: "content") to locate file:line positions to change.
-                        2. read_file around those lines to grab exact context for each old_string.
+                        1. start_search (searchType: "content") to locate the file:line positions.
+                        2. read_file around those lines to copy exact context for each old_string.
                         3. edit_block_multiple with all the edits at once.
 
-                        INPUT:
-                        - edits: array of { file_path, old_string, new_string, expected_replacements? (default 1) }
-                          Multiple edits may target the same file; they are applied in order on that file.
+                        Input: { edits: [ { file_path, old_string, new_string, expected_replacements? (default 1) }, ... ] }
+                        Multiple edits may target the same file; they are applied in order to that file.
 
-                        SEMANTICS:
-                        - PER-FILE ATOMIC: all edits for a file are applied in one read-modify-write; if ANY
-                          edit in a file fails to match exactly, that file is left COMPLETELY UNCHANGED and
-                          the failures are reported (with a fuzzy closest-match hint on a miss).
-                        - CROSS-FILE INDEPENDENT: a failure in one file never affects another; files are
-                          processed concurrently.
-                        - Plain-text search/replace only (same matching engine as edit_block's text path).
-                          For Excel/DOCX structured edits, use edit_block per file. To CREATE files, use
-                          write_multiple_files.
+                        BEHAVIOR:
+                        - PER-FILE ATOMIC: all edits for a file are applied in one read-modify-write;
+                          if ANY edit in a file does not match exactly, that file is left UNCHANGED
+                          and the failure is reported with a closest-match hint.
+                        - Files are processed concurrently and independently; a failure in one file
+                          never affects another.
+                        - Plain-text search/replace only (same matching as edit_block). For Excel or
+                          DOCX edits use edit_block per file; to CREATE files use write_multiple_files.
 
-                        Each old_string should include enough surrounding context to match uniquely
+                        Each old_string must include enough surrounding context to match uniquely
                         (1-3 lines), exactly like edit_block.
 
                         ${PATH_GUIDANCE}
