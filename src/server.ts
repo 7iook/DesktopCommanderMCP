@@ -37,6 +37,7 @@ import {
     WriteMultipleFilesArgsSchema,
     CreateDirectoryArgsSchema,
     ListDirectoryArgsSchema,
+    ListMultipleDirectoriesArgsSchema,
     MoveFileArgsSchema,
     GetFileInfoArgsSchema,
     InspectFileArgsSchema,
@@ -597,6 +598,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 _meta: buildUiToolMeta(FILE_PREVIEW_RESOURCE_URI, true, showMcpUiPreviews),
                 annotations: {
                     title: "List Directory Contents",
+                    readOnlyHint: true,
+                },
+            },
+            {
+                name: "list_multiple_directories",
+                description: `
+                        List MULTIPLE directories in ONE call. PREFER THIS over calling
+                        list_directory repeatedly.
+
+                        WHEN TO USE (default for any multi-directory listing):
+                        - Any time you are about to call list_directory more than once in a row.
+                        - Surveying several folders at once (e.g. src, test, and config) before
+                          deciding where to work.
+                        Each list_directory call is a full model turn; batching collapses N
+                        round-trips into one.
+
+                        Input: { paths: string[], depth? (default 2) }
+                        The same depth applies to every directory.
+
+                        BEHAVIOR:
+                        - Directories are listed concurrently. A failure on one (missing or denied)
+                          is reported in its own section and does NOT abort the others.
+                        - Each directory is rendered under its own "=== <path> ===" header.
+                        - Combined output is capped to protect context; narrow depth or list fewer
+                          directories per call if you hit the cap.
+
+                        For a single directory, use list_directory (it also supports offset/limit
+                        pagination for very large folders).
+
+                        ${PATH_GUIDANCE}
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(ListMultipleDirectoriesArgsSchema),
+                annotations: {
+                    title: "List Multiple Directories",
                     readOnlyHint: true,
                 },
             },
@@ -1644,6 +1679,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
             case "list_directory":
                 result = await handlers.handleListDirectory(args);
+                break;
+
+            case "list_multiple_directories":
+                result = await handlers.handleListMultipleDirectories(args);
                 break;
 
             case "inspect_file":

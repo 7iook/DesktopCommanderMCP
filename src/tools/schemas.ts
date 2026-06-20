@@ -209,6 +209,13 @@ export const ListDirectoryArgsSchema = z.object({
   limit: z.number().optional(),  // Default applied at handler from config.responseMaxEntries
 });
 
+// Batch list multiple directories in one call. The list counterpart of
+// read_multiple_files — one model turn instead of N list_directory calls.
+export const ListMultipleDirectoriesArgsSchema = z.object({
+  paths: z.array(z.string()).min(1),
+  depth: z.number().optional().default(2),
+});
+
 export const MoveFileArgsSchema = z.object({
   source: z.string(),
   destination: z.string(),
@@ -384,6 +391,7 @@ export const toolArgSchemas: Record<string, z.ZodTypeAny> = {
   write_pdf: WritePdfArgsSchema,
   create_directory: CreateDirectoryArgsSchema,
   list_directory: ListDirectoryArgsSchema,
+  list_multiple_directories: ListMultipleDirectoriesArgsSchema,
   move_file: MoveFileArgsSchema,
   start_search: StartSearchArgsSchema,
   get_more_search_results: GetMoreSearchResultsArgsSchema,

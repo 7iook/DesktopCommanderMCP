@@ -27,6 +27,7 @@ import {
     WriteMultipleFilesArgsSchema,
     CreateDirectoryArgsSchema,
     ListDirectoryArgsSchema,
+    ListMultipleDirectoriesArgsSchema,
     MoveFileArgsSchema,
     GetFileInfoArgsSchema,
     InspectFileArgsSchema,
@@ -543,6 +544,73 @@ export async function handleListDirectory(args: unknown): Promise<ServerResult> 
                 // render from here and would otherwise show an empty directory.
                 content: finalText,
             },
+        };
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        return createErrorResponse(errorMessage);
+    }
+}
+
+/**
+ * Handle list_multiple_directories command — batch list in one call.
+ *
+ * The list counterpart of read_multiple_files: collapses N list_directory
+ * round-trips into one. Directories are listed concurrently; a failure on one
+ * (missing / denied) is reported in its own section and never aborts the rest.
+ * A combined char cap keeps a few large trees from blowing up host context.
+ */
+export async function handleListMultipleDirectories(args: unknown): Promise<ServerResult> {
+    try {
+        const parsed = ListMultipleDirectoriesArgsSchema.parse(args);
+        const config = await configManager.getConfig();
+        const responseMaxChars = config.responseMaxChars ?? 50000;
+
+        const sections = await Promise.all(parsed.paths.map(async (p) => {
+            const resolved = resolveAbsolutePath(p);
+            try {
+                const entries = await listDirectory(p, parsed.depth);
+                // listDirectory does not throw when the TOP path is unreadable;
+                // it returns a single [NOT_FOUND]/[DENIED] marker line. Treat
+                // that as a per-directory failure so the summary is accurate.
+                if (entries.length === 1 && /^\[(NOT_FOUND|DENIED)\]/.test(entries[0])) {
+                    return { path: resolved, ok: false, body: entries[0], count: 0 };
+                }
+                return { path: resolved, ok: true, body: entries.join('\n'), count: entries.length };
+            } catch (error) {
+                return { path: resolved, ok: false, body: error instanceof Error ? error.message : String(error), count: 0 };
+            }
+        }));
+
+        const okCount = sections.filter(s => s.ok).length;
+        const failCount = sections.length - okCount;
+
+        // Render each directory as its own labelled block.
+        const blocks = sections.map(s => {
+            const header = s.ok ? `=== ${s.path} (${s.count} entries) ===` : `=== ${s.path} (ERROR) ===`;
+            return `${header}\n${s.body || '(empty)'}`;
+        });
+        let resultText = blocks.join('\n\n');
+
+        // Combined char cap, snapping to a clean newline boundary.
+        if (resultText.length > responseMaxChars) {
+            let trimmed = resultText.slice(0, responseMaxChars);
+            const lastNl = trimmed.lastIndexOf('\n');
+            if (lastNl > responseMaxChars * 0.5) trimmed = trimmed.slice(0, lastNl);
+            resultText = `${trimmed}\n\n[Output capped at ${responseMaxChars} chars; narrow depth or list fewer directories per call.]`;
+        }
+
+        const summary = `Listed ${okCount}/${sections.length} directories${failCount ? ` (${failCount} failed)` : ''}.`;
+
+        return {
+            content: [{ type: "text", text: `${summary}\n\n${resultText}` }],
+            structuredContent: {
+                sourceTool: 'list_multiple_directories',
+                total: sections.length,
+                succeeded: okCount,
+                failed: failCount,
+                results: sections,
+            },
+            isError: failCount > 0 && okCount === 0,
         };
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
