@@ -23,9 +23,9 @@ import { capture } from '../utils/capture.js';
 import { withFileLock } from '../utils/file-mutex.js';
 import { getFileHandler } from '../utils/files/index.js';
 import { createErrorResponse } from '../error-handlers.js';
-import { EditBlockArgsSchema } from "./schemas.js";
+import { EditBlockArgsSchema, EditBlockMultipleArgsSchema } from "./schemas.js";
 import path from 'path';
-import { detectLineEnding, normalizeLineEndings } from '../utils/lineEndingHandler.js';
+import { detectLineEnding, normalizeLineEndings, type LineEndingStyle } from '../utils/lineEndingHandler.js';
 import { configManager } from '../config-manager.js';
 import { fuzzySearchLogger, type FuzzySearchLogEntry } from '../utils/fuzzySearchLogger.js';
 import { resolvePreviewFileType } from '../ui/file-preview/shared/preview-file-types.js';
@@ -115,8 +115,58 @@ function getCharacterCodeData(expected: string, actual: string): {
     };
 }
 
+/**
+ * Result of an in-memory exact search/replace (no I/O).
+ */
+export interface ExactReplaceResult {
+    count: number;          // exact occurrences found in `content`
+    applied: boolean;       // true iff count>0 && count===expectedReplacements
+    newContent: string;     // mutated content when applied, else === input content
+}
+
+/**
+ * Pure exact-match search/replace on an in-memory string. Shared by
+ * performSearchReplace (single edit) and editBlockMultiple (batch) so the
+ * matching/replacement semantics live in ONE place (SSOT — see this file's
+ * header tech-debt note). No fuzzy fallback, no I/O, no telemetry — callers
+ * own those. `lineEnding` is the file's detected EOL so the search/replace
+ * strings are normalized to match.
+ */
+export function exactReplaceInContent(
+    content: string,
+    search: string,
+    replace: string,
+    expectedReplacements: number,
+    lineEnding: LineEndingStyle
+): ExactReplaceResult {
+    const normalizedSearch = normalizeLineEndings(search, lineEnding);
+    if (normalizedSearch === '') {
+        return { count: 0, applied: false, newContent: content };
+    }
+
+    let count = 0;
+    let pos = content.indexOf(normalizedSearch);
+    while (pos !== -1) {
+        count++;
+        pos = content.indexOf(normalizedSearch, pos + 1);
+    }
+
+    if (count > 0 && count === expectedReplacements) {
+        const normalizedReplace = normalizeLineEndings(replace, lineEnding);
+        let newContent: string;
+        if (expectedReplacements === 1) {
+            const i = content.indexOf(normalizedSearch);
+            newContent = content.slice(0, i) + normalizedReplace + content.slice(i + normalizedSearch.length);
+        } else {
+            newContent = content.split(normalizedSearch).join(normalizedReplace);
+        }
+        return { count, applied: true, newContent };
+    }
+
+    return { count, applied: false, newContent: content };
+}
+
 export async function performSearchReplace(filePath: string, block: SearchReplace, expectedReplacements: number = 1): Promise<ServerResult> {
-    // Get file extension for telemetry using path module
     const fileExtension = path.extname(filePath).toLowerCase();
     
     // Capture file extension and string sizes in telemetry without capturing the file path
@@ -169,33 +219,14 @@ export async function performSearchReplace(filePath: string, block: SearchReplac
     // Normalize search string to match file's line endings
     const normalizedSearch = normalizeLineEndings(block.search, fileLineEnding);
     
-    // First try exact match
-    let tempContent = content;
-    let count = 0;
-    let pos = tempContent.indexOf(normalizedSearch);
-    
-    while (pos !== -1) {
-        count++;
-        pos = tempContent.indexOf(normalizedSearch, pos + 1);
-    }
-    
+    // First try exact match via the shared pure core (SSOT with editBlockMultiple).
+    const exact = exactReplaceInContent(content, block.search, block.replace, expectedReplacements, fileLineEnding);
+    const count = exact.count;
+
     // If exact match found and count matches expected replacements, proceed with exact replacement
-    if (count > 0 && count === expectedReplacements) {
-        // Replace all occurrences
-        let newContent = content;
-        
-        // If we're only replacing one occurrence, replace it directly
-        if (expectedReplacements === 1) {
-            const searchIndex = newContent.indexOf(normalizedSearch);
-            newContent = 
-                newContent.substring(0, searchIndex) + 
-                normalizeLineEndings(block.replace, fileLineEnding) + 
-                newContent.substring(searchIndex + normalizedSearch.length);
-        } else {
-            // Replace all occurrences using split and join for multiple replacements
-            newContent = newContent.split(normalizedSearch).join(normalizeLineEndings(block.replace, fileLineEnding));
-        }
-        
+    if (exact.applied) {
+        const newContent = exact.newContent;
+
         // Check if search or replace text has too many lines
         const searchLines = block.search.split('\n').length;
         const replaceLines = block.replace.split('\n').length;
@@ -556,4 +587,196 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
         search: parsed.old_string,
         replace: parsed.new_string
     }, parsed.expected_replacements);
+}
+
+/**
+ * One edit in a batch request (text search/replace only).
+ */
+export interface MultiEditInput {
+    file_path: string;
+    old_string: string;
+    new_string: string;
+    expected_replacements?: number;
+}
+
+interface PerEditResult {
+    index: number;        // index within this file's edit list (0-based)
+    ok: boolean;
+    count: number;        // exact occurrences found
+    reason?: string;      // failure reason
+    hint?: string;        // closest-match context on a miss
+}
+
+/**
+ * edit_block_multiple — batch surgical text edits across many files/positions
+ * in ONE call. The batch counterpart of write_multiple_files (which already
+ * covers batch CREATE); use this for batch EDIT.
+ *
+ * Semantics:
+ *  - Edits are grouped by file; each file is read once, all its edits applied
+ *    in memory (sequentially, each on the running content), then written ONCE.
+ *  - PER-FILE ATOMIC: if any edit in a file fails to match exactly, that file
+ *    is left completely untouched (nothing written) and the failures reported.
+ *  - CROSS-FILE INDEPENDENT + concurrent: a failure in one file never affects
+ *    another; different files run in parallel (per-path lock prevents races).
+ *  - Plain-text search/replace only (same engine as edit_block's text path).
+ *    For Excel/DOCX structured edits, use edit_block per file.
+ */
+export async function editBlockMultiple(edits: MultiEditInput[]): Promise<ServerResult> {
+    capture('server_edit_block_multiple', { editCount: edits.length });
+
+    // Group by file path, preserving per-file edit order.
+    const groups = new Map<string, MultiEditInput[]>();
+    for (const e of edits) {
+        const key = e.file_path;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key)!.push(e);
+    }
+
+    interface FileOutcome {
+        file_path: string;
+        ok: boolean;            // file written (all edits applied)
+        appliedCount: number;   // edits applied in memory
+        editResults: PerEditResult[];
+        error?: string;         // file-level error (e.g. path/read failure)
+    }
+
+    const runFile = async (file_path: string, fileEdits: MultiEditInput[]): Promise<FileOutcome> => {
+        let validPath: string;
+        try {
+            validPath = await validatePath(file_path);
+        } catch (error) {
+            return {
+                file_path, ok: false, appliedCount: 0,
+                editResults: fileEdits.map((_, i) => ({ index: i, ok: false, count: 0, reason: 'invalid/forbidden path' })),
+                error: error instanceof Error ? error.message : String(error),
+            };
+        }
+
+        return withFileLock(validPath, async () => {
+            let content: string;
+            try {
+                const read = await readFileInternal(validPath, 0, Number.MAX_SAFE_INTEGER);
+                if (typeof read !== 'string') throw new Error('file content is not text');
+                content = read;
+            } catch (error) {
+                return {
+                    file_path, ok: false, appliedCount: 0,
+                    editResults: fileEdits.map((_, i) => ({ index: i, ok: false, count: 0, reason: 'read failed' })),
+                    error: error instanceof Error ? error.message : String(error),
+                };
+            }
+
+            const lineEnding = detectLineEnding(content);
+            let running = content;
+            const editResults: PerEditResult[] = [];
+            let allOk = true;
+
+            for (let i = 0; i < fileEdits.length; i++) {
+                const ed = fileEdits[i];
+                const expected = ed.expected_replacements ?? 1;
+                if (!ed.old_string) {
+                    editResults.push({ index: i, ok: false, count: 0, reason: 'empty old_string' });
+                    allOk = false;
+                    continue;
+                }
+                if (ed.new_string === undefined) {
+                    editResults.push({ index: i, ok: false, count: 0, reason: 'missing new_string' });
+                    allOk = false;
+                    continue;
+                }
+                const res = exactReplaceInContent(running, ed.old_string, ed.new_string, expected, lineEnding);
+                if (res.applied) {
+                    running = res.newContent;
+                    editResults.push({ index: i, ok: true, count: res.count });
+                } else {
+                    allOk = false;
+                    let reason: string;
+                    let hint: string | undefined;
+                    if (res.count === 0) {
+                        reason = 'no exact match';
+                        // Fuzzy hint so the AI can fix the search string without a round-trip.
+                        try {
+                            const fuzzy = await runFuzzySearchInWorker(running, ed.old_string);
+                            const sim = getSimilarityRatio(ed.old_string, fuzzy.value);
+                            hint = `closest ${Math.round(sim * 100)}% match:\n${extractContextAround(running, fuzzy.value)}`;
+                        } catch { /* hint is best-effort */ }
+                    } else {
+                        reason = `found ${res.count} occurrence(s) but expected ${expected} — set expected_replacements=${res.count} or make old_string more unique`;
+                    }
+                    editResults.push({ index: i, ok: false, count: res.count, reason, hint });
+                }
+            }
+
+            // Per-file atomic: only write when every edit applied.
+            if (allOk) {
+                try {
+                    const handler = await getFileHandler(validPath);
+                    await handler.write(validPath, running, 'rewrite');
+                } catch (error) {
+                    return {
+                        file_path, ok: false, appliedCount: editResults.filter(r => r.ok).length, editResults,
+                        error: `write failed: ${error instanceof Error ? error.message : String(error)}`,
+                    };
+                }
+            }
+
+            return {
+                file_path,
+                ok: allOk,
+                appliedCount: editResults.filter(r => r.ok).length,
+                editResults,
+            };
+        });
+    };
+
+    const outcomes = await Promise.all(
+        Array.from(groups.entries()).map(([fp, fe]) => runFile(fp, fe))
+    );
+
+    const filesOk = outcomes.filter(o => o.ok).length;
+    const filesFail = outcomes.length - filesOk;
+    const editsApplied = outcomes.reduce((n, o) => n + (o.ok ? o.appliedCount : 0), 0);
+    const editsFailed = outcomes.reduce((n, o) => n + o.editResults.filter(r => !r.ok).length, 0);
+
+    const lines: string[] = [];
+    for (const o of outcomes) {
+        if (o.ok) {
+            lines.push(`✅ ${o.file_path} (${o.appliedCount} edit${o.appliedCount === 1 ? '' : 's'} applied)`);
+        } else {
+            const failed = o.editResults.filter(r => !r.ok);
+            const head = o.error
+                ? `❌ ${o.file_path} — ${o.error} (file unchanged)`
+                : `❌ ${o.file_path} — ${failed.length} edit(s) failed, file left unchanged (per-file atomic)`;
+            lines.push(head);
+            for (const r of failed) {
+                lines.push(`   • edit #${r.index + 1}: ${r.reason}`);
+                if (r.hint) lines.push(`     ↳ ${r.hint.replace(/\n/g, '\n       ')}`);
+            }
+        }
+    }
+
+    const summary = `Batch edit: ${filesOk}/${outcomes.length} files updated, ${editsApplied} edit(s) applied, ${editsFailed} failed.`;
+
+    return {
+        content: [{ type: "text", text: `${summary}\n${lines.join('\n')}` }],
+        structuredContent: {
+            sourceTool: 'edit_block_multiple',
+            totalFiles: outcomes.length,
+            filesUpdated: filesOk,
+            filesFailed: filesFail,
+            editsApplied,
+            editsFailed,
+            results: outcomes,
+        },
+        isError: filesFail > 0 && filesOk === 0,
+    };
+}
+
+/**
+ * Handle edit_block_multiple command.
+ */
+export async function handleEditBlockMultiple(args: unknown): Promise<ServerResult> {
+    const parsed = EditBlockMultipleArgsSchema.parse(args);
+    return editBlockMultiple(parsed.edits);
 }

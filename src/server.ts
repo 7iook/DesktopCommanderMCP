@@ -44,6 +44,7 @@ import {
     SetConfigValueArgsSchema,
     ListProcessesArgsSchema,
     EditBlockArgsSchema,
+    EditBlockMultipleArgsSchema,
     GetUsageStatsArgsSchema,
     GiveFeedbackArgsSchema,
     StartSearchArgsSchema,
@@ -888,6 +889,45 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     openWorldHint: false,
                 },
             },
+            {
+                name: "edit_block_multiple",
+                description: `
+                        Apply MULTIPLE surgical text edits across one or many files in a SINGLE call.
+                        The batch counterpart of write_multiple_files (which does batch CREATE) — use
+                        this for batch EDIT instead of many individual edit_block round-trips.
+
+                        TYPICAL WORKFLOW:
+                        1. start_search (searchType: "content") to locate file:line positions to change.
+                        2. read_file around those lines to grab exact context for each old_string.
+                        3. edit_block_multiple with all the edits at once.
+
+                        INPUT:
+                        - edits: array of { file_path, old_string, new_string, expected_replacements? (default 1) }
+                          Multiple edits may target the same file; they are applied in order on that file.
+
+                        SEMANTICS:
+                        - PER-FILE ATOMIC: all edits for a file are applied in one read-modify-write; if ANY
+                          edit in a file fails to match exactly, that file is left COMPLETELY UNCHANGED and
+                          the failures are reported (with a fuzzy closest-match hint on a miss).
+                        - CROSS-FILE INDEPENDENT: a failure in one file never affects another; files are
+                          processed concurrently.
+                        - Plain-text search/replace only (same matching engine as edit_block's text path).
+                          For Excel/DOCX structured edits, use edit_block per file. To CREATE files, use
+                          write_multiple_files.
+
+                        Each old_string should include enough surrounding context to match uniquely
+                        (1-3 lines), exactly like edit_block.
+
+                        ${PATH_GUIDANCE}
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(EditBlockMultipleArgsSchema),
+                annotations: {
+                    title: "Edit Block (Batch)",
+                    readOnlyHint: false,
+                    destructiveHint: true,
+                    openWorldHint: false,
+                },
+            },
 
             // Terminal tools
             {
@@ -1629,6 +1669,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
             case "edit_block":
                 result = await handlers.handleEditBlock(args);
+                break;
+
+            case "edit_block_multiple":
+                result = await handlers.handleEditBlockMultiple(args);
                 break;
 
             default:

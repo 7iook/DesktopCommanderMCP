@@ -251,6 +251,18 @@ export const EditBlockArgsSchema = z.object({
   { message: "Must provide either (old_string + new_string) or (range + content)" }
 );
 
+// Batch text edit across multiple files/positions in one call. The edit
+// counterpart of write_multiple_files (batch create). Text search/replace
+// only; for Excel/DOCX structured edits use edit_block per file.
+export const EditBlockMultipleArgsSchema = z.object({
+  edits: z.array(z.object({
+    file_path: z.string(),
+    old_string: z.string(),
+    new_string: z.string(),
+    expected_replacements: z.number().optional().default(1),
+  })).min(1),
+});
+
 // Send input to process schema
 export const InteractWithProcessArgsSchema = z.object({
   pid: z.number(),
@@ -368,6 +380,7 @@ export const toolArgSchemas: Record<string, z.ZodTypeAny> = {
   read_multiple_files: ReadMultipleFilesArgsSchema,
   write_file: WriteFileArgsSchema,
   write_multiple_files: WriteMultipleFilesArgsSchema,
+  edit_block_multiple: EditBlockMultipleArgsSchema,
   write_pdf: WritePdfArgsSchema,
   create_directory: CreateDirectoryArgsSchema,
   list_directory: ListDirectoryArgsSchema,
