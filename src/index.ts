@@ -11,6 +11,7 @@ import { capture } from './utils/capture.js';
 import { logToStderr, logger } from './utils/logger.js';
 import { runRemote } from './npm-scripts/remote.js';
 import { ensureChromeAvailable } from './tools/pdf/markdown.js';
+import { startMainThreadWatchdog } from './utils/main-thread-watchdog.js';
 
 // Store messages to defer until after initialization
 const deferredMessages: Array<{ level: string, message: string }> = [];
@@ -53,6 +54,9 @@ async function runServer() {
 
     // Export transport for use throughout the application
     global.mcpTransport = transport;
+
+    // Opt-in main-thread stall watchdog (DC_WATCHDOG=1). Diagnostic only.
+    startMainThreadWatchdog();
 
     try {
       deferLog('info', 'Loading configuration...');

@@ -3,6 +3,8 @@
  * Detects when processes are waiting for input vs finished vs running
  */
 
+import { markHotPathEnter, markHotPathExit } from './main-thread-watchdog.js';
+
 export interface ProcessState {
   isWaitingForInput: boolean;
   isFinished: boolean;
@@ -86,6 +88,15 @@ const COMPLETION_INDICATORS = [
  * Analyze process output to determine current state
  */
 export function analyzeProcessState(output: string, pid?: number): ProcessState {
+  markHotPathEnter(1, output ? output.length : 0);
+  try {
+    return analyzeProcessStateImpl(output, pid);
+  } finally {
+    markHotPathExit();
+  }
+}
+
+function analyzeProcessStateImpl(output: string, pid?: number): ProcessState {
   if (!output || output.trim().length === 0) {
     return {
       isWaitingForInput: false,
@@ -187,6 +198,15 @@ export function analyzeProcessState(output: string, pid?: number): ProcessState 
  * Clean output by removing prompts and input echoes
  */
 export function cleanProcessOutput(output: string, inputSent?: string): string {
+  markHotPathEnter(2, output ? output.length : 0);
+  try {
+    return cleanProcessOutputImpl(output, inputSent);
+  } finally {
+    markHotPathExit();
+  }
+}
+
+function cleanProcessOutputImpl(output: string, inputSent?: string): string {
   let cleaned = output;
 
   // Remove input echo if provided

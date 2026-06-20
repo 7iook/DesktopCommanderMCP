@@ -5,6 +5,7 @@ import { DEFAULT_COMMAND_TIMEOUT } from './config.js';
 import { configManager } from './config-manager.js';
 import {capture} from "./utils/capture.js";
 import { analyzeProcessState } from './utils/process-detection.js';
+import { markHotPathEnter, markHotPathExit } from './utils/main-thread-watchdog.js';
 
 /**
  * Standard Windows PATHEXT value, used to repair a corrupted PATHEXT before
@@ -613,6 +614,15 @@ export class TerminalManager {
    * "#< CLIXML" header) is held in session.cliXmlCarry until the next chunk.
    */
   private filterCliXmlStream(session: TerminalSession, text: string): string {
+    markHotPathEnter(4, text ? text.length : 0);
+    try {
+      return this.filterCliXmlStreamImpl(session, text);
+    } finally {
+      markHotPathExit();
+    }
+  }
+
+  private filterCliXmlStreamImpl(session: TerminalSession, text: string): string {
     if (!session.stripCliXml || !text) return text;
 
     let buf = (session.cliXmlCarry ?? '') + text;
@@ -677,6 +687,16 @@ export class TerminalManager {
    */
   private appendToLineBuffer(session: TerminalSession, text: string): void {
     if (!text) return;
+    markHotPathEnter(3, text.length);
+    try {
+      this.appendToLineBufferImpl(session, text);
+    } finally {
+      markHotPathExit();
+    }
+  }
+
+  private appendToLineBufferImpl(session: TerminalSession, text: string): void {
+    if (!text) return;
 
     // Split text into lines, keeping track of whether text ends with newline
     const lines = text.split('\n');
@@ -716,13 +736,30 @@ export class TerminalManager {
     // Enforce the per-session cap by evicting the oldest lines. Keeps the
     // buffer far below V8's max string length so concatenation and join()
     // can never throw "Invalid string length" and kill the server.
-    while (session.bufferedChars > MAX_BUFFERED_OUTPUT_CHARS && session.outputLines.length > 1) {
-      const dropped = session.outputLines.shift()!;
-      const droppedJoinedChars = dropped.length + 1; // +1 for its join separator
-      session.bufferedChars -= droppedJoinedChars;
-      session.evictedChars += droppedJoinedChars;
-      session.evictedLines++;
-      if (session.lastReadIndex > 0) session.lastReadIndex--;
+    //
+    // PERF: compute how many oldest lines to drop, then remove them in a SINGLE
+    // splice. The previous implementation called Array.shift() once per evicted
+    // line — shift() is O(n) (re-indexes the whole array), so evicting K lines
+    // from an N-line buffer was O(N*K). On verbose output (typecheck/eslint/
+    // trial harnesses emitting hundreds of thousands of short lines near the
+    // 50MB cap) every incoming chunk re-triggered thousands of O(N) shifts,
+    // pegging the main thread for seconds and freezing the whole MCP server
+    // (confirmed by the stall watchdog pointing here). One splice is O(N) total.
+    if (session.bufferedChars > MAX_BUFFERED_OUTPUT_CHARS && session.outputLines.length > 1) {
+      const maxDrop = session.outputLines.length - 1; // always keep >= 1 line
+      let dropCount = 0;
+      let freed = 0;
+      while (dropCount < maxDrop && (session.bufferedChars - freed) > MAX_BUFFERED_OUTPUT_CHARS) {
+        freed += session.outputLines[dropCount].length + 1; // +1 for join separator
+        dropCount++;
+      }
+      if (dropCount > 0) {
+        session.outputLines.splice(0, dropCount);
+        session.bufferedChars -= freed;
+        session.evictedChars += freed;
+        session.evictedLines += dropCount;
+        session.lastReadIndex = Math.max(0, session.lastReadIndex - dropCount);
+      }
     }
   }
 
