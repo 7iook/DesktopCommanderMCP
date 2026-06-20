@@ -99,21 +99,6 @@ export function analyzeProcessState(output: string, pid?: number): ProcessState 
   const lastLine = lines[lines.length - 1] || '';
   const lastFewLines = lines.slice(-3).join('\n');
 
-  // Bound the strings fed to prompt/error regexes. APP_PROMPT_PATTERNS (and to
-  // a lesser extent the error patterns) contain backtracking-prone expressions
-  // (greedy classes, a variable-length lookbehind). A prompt sentinel always
-  // lives in the last few dozen chars, but a long-running/interactive command
-  // can emit a very long line with NO trailing newline (progress bars, status
-  // lines, piped build output). Running those regexes on a 10-100KB line
-  // triggers catastrophic backtracking that pegs one core at ~100%
-  // synchronously and freezes the whole event loop — every subsequent tool
-  // call (even read_file) then hangs until the host is restarted. Capping the
-  // regex input to a small tail makes worst-case backtracking bounded and
-  // cheap. endsWith/includes/split are linear and stay on the full strings.
-  const PROMPT_SCAN_MAX = 1000;
-  const lastLineForPrompt = lastLine.length > PROMPT_SCAN_MAX ? lastLine.slice(-PROMPT_SCAN_MAX) : lastLine;
-  const lastFewLinesForError = lastFewLines.length > PROMPT_SCAN_MAX ? lastFewLines.slice(-PROMPT_SCAN_MAX) : lastFewLines;
-
   // Cursor is parked on the last line iff output doesn't end with newline.
   // This is the strong signal that distinguishes "blocked on prompt" from
   // "still printing log lines". App-level prompt patterns only match here.
@@ -138,7 +123,7 @@ export function analyzeProcessState(output: string, pid?: number): ProcessState 
   // Application-level prompt detection — only when cursor is on a partial line.
   if (cursorOnPartialLine) {
     for (const pat of APP_PROMPT_PATTERNS) {
-      if (pat.test(lastLineForPrompt)) {
+      if (pat.test(lastLine)) {
         return {
           isWaitingForInput: true,
           isFinished: false,
@@ -166,7 +151,7 @@ export function analyzeProcessState(output: string, pid?: number): ProcessState 
 
   // Check for error completion (errors usually end with prompts, but let's be thorough)
   const hasErrorCompletion = ERROR_COMPLETION_PATTERNS.some(pattern => 
-    pattern.test(lastFewLinesForError)
+    pattern.test(lastFewLines)
   );
 
   if (hasErrorCompletion) {
