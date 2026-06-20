@@ -1,6 +1,6 @@
 import { terminalManager, MAX_BUFFERED_OUTPUT_CHARS } from '../terminal-manager.js';
 import { commandManager } from '../command-manager.js';
-import { StartProcessArgsSchema, ReadProcessOutputArgsSchema, InteractWithProcessArgsSchema, ForceTerminateArgsSchema, ListSessionsArgsSchema } from './schemas.js';
+import { StartProcessArgsSchema, ReadProcessOutputArgsSchema, InteractWithProcessArgsSchema, InteractWithProcessLinesArgsSchema, ForceTerminateArgsSchema, ListSessionsArgsSchema } from './schemas.js';
 import { capture } from "../utils/capture.js";
 import { ServerResult } from '../types.js';
 import { analyzeProcessState, cleanProcessOutput, formatProcessStateMessage, ProcessState } from '../utils/process-detection.js';
@@ -434,6 +434,7 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
     timeout_ms = 5000, 
     offset = 0,                    // 0 = from last read, positive = absolute, negative = tail
     length = defaultLength,        // Default from config, same as file reading
+    follow_ms,                     // tail -f window (ms); see schema
     verbose_timing = false 
   } = parsed.data;
 
@@ -442,8 +443,28 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
 
   // For active sessions with no new output yet, optionally wait for output
   const session = terminalManager.getSession(pid);
+
+  // tail -f follow for absolute/tail reads (offset !== 0). After the page is
+  // computed below, this waits for NEW lines to be appended. We capture the
+  // baseline line count BEFORE the wait so we only resolve on genuinely new
+  // output. For offset === 0 the existing "new output" wait already covers
+  // this, and follow_ms (if given) extends that window.
+  if (session && follow_ms && follow_ms > 0 && offset !== 0) {
+    const baseline = terminalManager.getOutputLineCount(pid) || 0;
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => { if (done) return; done = true; clearInterval(iv); clearTimeout(to); resolve(); };
+      const iv = setInterval(() => {
+        const now = terminalManager.getOutputLineCount(pid) || 0;
+        if (now > baseline || !terminalManager.getSession(pid)) finish();
+      }, 50);
+      const to = setTimeout(finish, follow_ms);
+    });
+  }
+
   if (session && offset === 0) {
     // Wait for new output to arrive (only for "new output" reads, not absolute/tail)
+    const effectiveWaitMs = (follow_ms && follow_ms > 0) ? follow_ms : timeout_ms;
     const waitForOutput = (): Promise<void> => {
       return new Promise((resolve) => {
         // Check if there's already new output
@@ -480,7 +501,7 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
         // Timeout
         timeout = setTimeout(() => {
           resolveOnce();
-        }, timeout_ms);
+        }, effectiveWaitMs);
       });
     };
 
@@ -863,7 +884,10 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
     } else if (processState.isFinished) {
       statusMessage = `\n✅ ${formatProcessStateMessage(processState, pid)}`;
     } else if (timeoutReached) {
-      statusMessage = '\n⏱️ Response may be incomplete (timeout reached)';
+      // Still running and producing (or about to). Point the model at the
+      // bounded tail-follow read instead of leaving it guessing — this is the
+      // main reason callers miss live log output from long interactive runs.
+      statusMessage = `\n⏱️ Response may be incomplete (timeout reached). Process ${pid} may still be running — use read_process_output(pid=${pid}, offset=-50, follow_ms=3000) to tail its live output.`;
     }
 
     // Add timing information if requested
@@ -930,6 +954,216 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
       isError: true,
     };
   }
+}
+
+/**
+ * Built-in prompt regex used when no wait_for is supplied. Matches a line
+ * that ends with a typical prompt sentinel (colon / question / >, #, $) or a
+ * closing paren, optionally followed by trailing whitespace. Tested against
+ * the LAST line of the newly-printed output only.
+ */
+const DEFAULT_PROMPT_REGEX_SOURCE = '[:?>#$]\\s*$|\\)\\s*$';
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * True when the tail (last line) of `text` matches `re`.
+ * Prompts are usually printed WITHOUT a trailing newline ("Name: "), so we
+ * test the segment after the last newline.
+ */
+function tailMatchesPrompt(text: string, re: RegExp): boolean {
+  if (!text) return false;
+  const lastNl = text.lastIndexOf('\n');
+  const tail = lastNl >= 0 ? text.slice(lastNl + 1) : text;
+  return re.test(tail);
+}
+
+/**
+ * interact_with_process_lines — expect/spawn-style sequential input.
+ *
+ * Sends each line and waits for the next prompt to ACTUALLY appear before
+ * sending the following line. This is the reliable alternative to writing a
+ * multi-line blob to stdin in one shot: an async line-reader (Rust BufRead,
+ * Node readline, shell `read`) would otherwise consume queued newlines before
+ * its prompts have flushed, so every later line lands on the wrong prompt.
+ */
+export async function interactWithProcessLines(args: unknown): Promise<ServerResult> {
+  const parsed = InteractWithProcessLinesArgsSchema.safeParse(args);
+  if (!parsed.success) {
+    return {
+      content: [{ type: "text", text: `Error: Invalid arguments for interact_with_process_lines: ${parsed.error}` }],
+      isError: true,
+    };
+  }
+
+  const {
+    pid,
+    lines,
+    default_wait_for,
+    default_timeout_ms,
+    default_append_newline,
+    settle_ms,
+    fail_fast,
+    collect_output,
+    verbose_timing = false,
+  } = parsed.data;
+
+  // Virtual Node sessions don't support incremental stdin prompting.
+  if (virtualNodeSessions.has(pid)) {
+    return {
+      content: [{ type: "text", text: `Error: interact_with_process_lines is not supported for node:local virtual sessions (PID ${pid}). Use interact_with_process with a complete script instead.` }],
+      isError: true,
+    };
+  }
+
+  if (!terminalManager.getSession(pid)) {
+    return {
+      content: [{ type: "text", text: `Error: No active session for process ${pid}. The process may have exited or doesn't accept input.` }],
+      isError: true,
+    };
+  }
+
+  capture('server_interact_with_process_lines', { pid, lineCount: lines.length });
+
+  const startTime = Date.now();
+
+  // Compile the regex once per distinct source (cheap; lines is small).
+  const compile = (src: string | undefined): RegExp =>
+    new RegExp(src && src.length > 0 ? src : DEFAULT_PROMPT_REGEX_SOURCE, 'm');
+
+  // Snapshot before the very first send for the aggregated view.
+  const aggregateSnapshot = terminalManager.captureOutputSnapshot(pid);
+
+  const perLine: Array<{ index: number; sent: string; matched: boolean; reason: string; ms: number; output?: string }> = [];
+  let sentCount = 0;
+  let aborted = false;
+  let abortReason = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const appendNewline = line.append_newline ?? default_append_newline;
+    const lineTimeout = line.timeout_ms ?? default_timeout_ms;
+    const useDelay = typeof line.delay_after_ms === 'number';
+    const re = compile(line.wait_for ?? default_wait_for);
+
+    const lineSnapshot = terminalManager.captureOutputSnapshot(pid);
+    const lineStart = Date.now();
+
+    const ok = terminalManager.sendInputToProcess(pid, line.input, appendNewline);
+    sentCount++;
+    if (!ok) {
+      perLine.push({ index: i, sent: line.input, matched: false, reason: 'send-failed', ms: Date.now() - lineStart });
+      aborted = true;
+      abortReason = `Failed to send line ${i + 1} — process exited or stdin closed`;
+      break;
+    }
+
+    // Wait strategy: fixed delay (escape hatch) OR poll for prompt.
+    let matched = false;
+    let reason = 'prompt-matched';
+    if (useDelay) {
+      await sleep(line.delay_after_ms as number);
+      matched = true;
+      reason = 'delay';
+    } else {
+      const deadline = Date.now() + lineTimeout;
+      while (Date.now() < deadline) {
+        // Process gone? stop waiting — final state handled after loop.
+        if (!terminalManager.getSession(pid) && !isPidAlive(pid)) {
+          reason = 'process-exited';
+          break;
+        }
+        const since = lineSnapshot ? (terminalManager.getOutputSinceSnapshot(pid, lineSnapshot) ?? '') : '';
+        if (tailMatchesPrompt(since, re)) {
+          matched = true;
+          break;
+        }
+        await sleep(30);
+      }
+      if (!matched && reason === 'prompt-matched') reason = 'timeout';
+    }
+
+    const lineOut = lineSnapshot ? (terminalManager.getOutputSinceSnapshot(pid, lineSnapshot) ?? '') : '';
+    if (collect_output === 'per_line') {
+      // Bound per-step output so a chatty step can't flood context.
+      const capped = lineOut.length > 4000 ? lineOut.slice(0, 4000) + '\n…[truncated]' : lineOut;
+      perLine.push({ index: i, sent: line.input, matched, reason, ms: Date.now() - lineStart, output: capped });
+    } else {
+      perLine.push({ index: i, sent: line.input, matched, reason, ms: Date.now() - lineStart });
+    }
+
+    if (!matched && reason === 'timeout' && fail_fast) {
+      aborted = true;
+      abortReason = `Line ${i + 1} timed out after ${lineTimeout}ms waiting for prompt (/${re.source}/). Stopped (fail_fast).`;
+      break;
+    }
+    if (reason === 'process-exited') {
+      aborted = true;
+      abortReason = `Process ${pid} exited while waiting after line ${i + 1}.`;
+      break;
+    }
+
+    // Let stdout/stdin settle before the next send.
+    if (i < lines.length - 1 && settle_ms > 0) await sleep(settle_ms);
+  }
+
+  // Final state + aggregated output.
+  const aggregateRaw = aggregateSnapshot
+    ? (terminalManager.getOutputSinceSnapshot(pid, aggregateSnapshot) ?? '')
+    : '';
+  let cleanOutput = cleanProcessOutput(aggregateRaw, lines.map(l => l.input).join('\n'));
+
+  const config = await configManager.getConfig();
+  const maxOutputLines = config.fileReadLineLimit ?? 1000;
+  let truncationMessage = '';
+  const outLines = cleanOutput.split('\n');
+  if (outLines.length > maxOutputLines) {
+    cleanOutput = outLines.slice(0, maxOutputLines).join('\n');
+    truncationMessage = `\n\n⚠️ Output truncated: ${maxOutputLines} of ${outLines.length} lines. Use read_process_output(pid=${pid}, offset/length) for the rest.`;
+  }
+  const responseMaxChars = config.responseMaxChars ?? 50000;
+  if (cleanOutput.length > responseMaxChars) {
+    cleanOutput = applyResponseCharCap(cleanOutput, responseMaxChars, `use read_process_output(pid=${pid}) for the rest`);
+  }
+
+  const processState = analyzeProcessState(aggregateRaw, pid);
+  let statusMessage = '';
+  if (!isPidAlive(pid) && !terminalManager.getSession(pid)) {
+    statusMessage = `\n✅ Process ${pid} has finished execution`;
+  } else if (processState.isWaitingForInput) {
+    statusMessage = `\n🔄 ${formatProcessStateMessage(processState, pid)}`;
+  } else {
+    statusMessage = `\n🔄 Process ${pid} still running — use read_process_output(pid=${pid}, offset=-50, follow_ms=3000) to tail.`;
+  }
+
+  // Build response text.
+  const header = aborted
+    ? `⚠️ Sent ${sentCount}/${lines.length} lines to process ${pid} — ${abortReason}`
+    : `✅ Sent ${sentCount}/${lines.length} lines to process ${pid}`;
+
+  const stepSummary = perLine.map(p => {
+    const tag = p.matched ? '✓' : '✗';
+    const out = p.output !== undefined ? `\n     ↳ ${p.output.replace(/\n/g, '\n       ')}` : '';
+    return `  ${tag} [${p.index + 1}] ${JSON.stringify(p.sent)} → ${p.reason} (${p.ms}ms)${out}`;
+  }).join('\n');
+
+  let timingMessage = '';
+  if (verbose_timing) {
+    timingMessage = `\n\n📊 Timing: ${Date.now() - startTime}ms total`;
+  }
+
+  let responseText = `${header}\n\n${stepSummary}`;
+  if (cleanOutput && cleanOutput.trim().length > 0) {
+    responseText += `\n\n📤 Output:\n${cleanOutput}`;
+  }
+  responseText += statusMessage + truncationMessage + timingMessage;
+
+  return {
+    content: [{ type: "text", text: responseText }],
+    isError: aborted ? true : false,
+  };
 }
 
 /**

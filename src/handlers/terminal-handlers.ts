@@ -2,6 +2,7 @@ import {
     startProcess, 
     readProcessOutput, 
     interactWithProcess,
+    interactWithProcessLines,
     forceTerminate, 
     listSessions 
 } from '../tools/improved-process-tools.js';
@@ -37,6 +38,13 @@ export async function handleReadProcessOutput(args: unknown): Promise<ServerResu
  */
 export async function handleInteractWithProcess(args: unknown): Promise<ServerResult> {
     return interactWithProcess(args);
+}
+
+/**
+ * Handle interact_with_process_lines command (expect/spawn-style sequential input)
+ */
+export async function handleInteractWithProcessLines(args: unknown): Promise<ServerResult> {
+    return interactWithProcessLines(args);
 }
 
 /**

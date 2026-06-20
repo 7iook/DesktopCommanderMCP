@@ -27,6 +27,7 @@ import {
     StartProcessArgsSchema,
     ReadProcessOutputArgsSchema,
     InteractWithProcessArgsSchema,
+    InteractWithProcessLinesArgsSchema,
     ForceTerminateArgsSchema,
     ListSessionsArgsSchema,
     KillProcessArgsSchema,
@@ -973,6 +974,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                           * Positive: Read from absolute line position
                           * Negative: Read last N lines from end (tail behavior)
                         - 'length' (max lines to read, default: configurable via 'fileReadLineLimit' setting)
+                        - 'follow_ms' (tail -f window): after computing the page, block up to this many ms
+                          waiting for NEW lines to be appended, returning as soon as any arrive. Use with a
+                          negative offset to watch a live-logging interactive process in bounded chunks, e.g.
+                          read_process_output({ pid, offset: -50, follow_ms: 3000 }).
                         
                         Examples:
                         - offset: 0, length: 100     → First 100 NEW lines since last read
@@ -1065,6 +1070,52 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 inputSchema: zodToJsonSchema(InteractWithProcessArgsSchema),
                 annotations: {
                     title: "Send Input to Process",
+                    readOnlyHint: false,
+                    destructiveHint: true,
+                    openWorldHint: true,
+                },
+            },
+            {
+                name: "interact_with_process_lines",
+                description: `
+                        Send MULTIPLE inputs to a running process ONE LINE AT A TIME, waiting for
+                        each prompt to actually appear before sending the next line (expect/spawn style).
+
+                        WHEN TO USE THIS INSTEAD OF interact_with_process:
+                        Use this whenever a process reads input prompt-by-prompt (Rust BufRead::read_line
+                        loops, Node readline, shell \`read\`, interactive CLI wizards / param editors that
+                        ask a series of questions). Sending a multi-line blob with interact_with_process
+                        writes everything to stdin at once; an async line-reader can consume the queued
+                        newlines BEFORE its prompts have flushed, so each later answer lands on the WRONG
+                        prompt. This tool eliminates that race by waiting for the next prompt per step.
+
+                        HOW IT WORKS (per line):
+                        1. Send the line's \`input\`.
+                        2. Wait until the process's newly-printed output ends with a prompt match
+                           (line.wait_for, else default_wait_for, else built-in regex \`[:?>#$]\\s*$|\\)\\s*$\`),
+                           up to timeout_ms.
+                        3. Settle briefly (settle_ms), then send the next line.
+
+                        PARAMETERS:
+                        - lines: array of { input, wait_for?, timeout_ms?, append_newline?, delay_after_ms? }
+                          * wait_for: regex SOURCE string to detect that step's prompt
+                          * delay_after_ms: escape hatch — fixed sleep instead of prompt detection
+                            (use when the prompt can't be regex-matched)
+                        - default_wait_for / default_timeout_ms (5000) / default_append_newline (true)
+                        - settle_ms (40): pause after each prompt before next send
+                        - fail_fast (true): stop at the first line whose prompt never appears
+                        - collect_output: 'aggregated' (default) or 'per_line'
+
+                        EXAMPLE (skip 11 prompts then answer the 12th):
+                        interact_with_process_lines({ pid, lines: [
+                          {input:""},{input:""},{input:""},{input:""},{input:""},{input:""},
+                          {input:""},{input:""},{input:""},{input:""},{input:""},{input:"local"}
+                        ]})
+
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(InteractWithProcessLinesArgsSchema),
+                annotations: {
+                    title: "Send Input Lines to Process",
                     readOnlyHint: false,
                     destructiveHint: true,
                     openWorldHint: true,
@@ -1494,6 +1545,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
             case "interact_with_process":
                 result = await handlers.handleInteractWithProcess(args);
+                break;
+
+            case "interact_with_process_lines":
+                result = await handlers.handleInteractWithProcessLines(args);
                 break;
 
             case "force_terminate":

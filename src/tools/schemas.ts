@@ -44,6 +44,63 @@ export const ReadProcessOutputArgsSchema = z.object({
   timeout_ms: z.number().optional(),
   offset: z.number().optional(),   // Line offset: 0=from last read, positive=absolute, negative=tail
   length: z.number().optional(),   // Max lines to return (default from config.fileReadLineLimit)
+  // tail -f style follow. When > 0, after computing the requested page the
+  // tool blocks up to follow_ms waiting for NEW lines to be appended, then
+  // returns as soon as any arrive (or the window elapses). Lets the model
+  // watch a live-logging interactive process in bounded, paginated chunks
+  // without busy-looping or flooding context. Typical use:
+  //   read_process_output({ pid, offset: -50, follow_ms: 3000 })
+  // = "show me the last 50 lines, then tail for up to 3s".
+  follow_ms: z.number().optional(),
+  verbose_timing: z.boolean().optional(),
+});
+
+// Per-line item for interact_with_process_lines. Objects only (NOT a
+// string|object union) — zodToJsonSchema would emit anyOf for a union and
+// some MCP clients (Cursor) reject anyOf in tool input schemas.
+export const InteractWithProcessLineItemSchema = z.object({
+  // The text to send for this step.
+  input: z.string(),
+  // Regex SOURCE string. After sending `input`, wait until the process's
+  // newly-printed output ends with a match before sending the next line.
+  // Overrides default_wait_for for this step. If neither is set, the built-in
+  // prompt regex is used.
+  wait_for: z.string().optional(),
+  // Per-step wait cap (ms). Overrides default_timeout_ms for this step.
+  timeout_ms: z.number().optional(),
+  // Per-step newline behavior. Overrides default_append_newline.
+  append_newline: z.boolean().optional(),
+  // Escape hatch: instead of waiting for a prompt, just sleep this many ms
+  // after sending (for processes whose prompt can't be regex-detected).
+  delay_after_ms: z.number().optional(),
+});
+
+// interact_with_process_lines: expect/spawn-style sequential input.
+// Sends each line and WAITS for the next prompt to actually appear before
+// sending the following line — fixes the core failure of writing a multi-line
+// blob to stdin all at once, where an async line-reader consumes newlines
+// before its prompts have flushed and every subsequent line lands on the
+// wrong prompt.
+export const InteractWithProcessLinesArgsSchema = z.object({
+  pid: z.number(),
+  lines: z.array(InteractWithProcessLineItemSchema).min(1),
+  // Default regex SOURCE used when a line has no own wait_for. Falsey ->
+  // built-in prompt regex (`[:?>#$]\s*$|\)\s*$`).
+  default_wait_for: z.string().optional(),
+  // Default per-line wait cap (ms).
+  default_timeout_ms: z.number().optional().default(5000),
+  // Default newline behavior per line.
+  default_append_newline: z.boolean().optional().default(true),
+  // After a prompt match (or delay), sleep this long before sending the next
+  // line so the process's stdout/stdin settle. Guards against racing a
+  // not-yet-fully-flushed prompt.
+  settle_ms: z.number().optional().default(40),
+  // When true (default), stop at the first line whose wait times out and
+  // return partial results instead of blindly feeding the rest.
+  fail_fast: z.boolean().optional().default(true),
+  // 'aggregated' (default): one combined output blob since the first send.
+  // 'per_line': structured per-step output (heavier; truncated per step).
+  collect_output: z.enum(['aggregated', 'per_line']).optional().default('aggregated'),
   verbose_timing: z.boolean().optional(),
 });
 
@@ -325,6 +382,7 @@ export const toolArgSchemas: Record<string, z.ZodTypeAny> = {
   start_process: StartProcessArgsSchema,
   read_process_output: ReadProcessOutputArgsSchema,
   interact_with_process: InteractWithProcessArgsSchema,
+  interact_with_process_lines: InteractWithProcessLinesArgsSchema,
   force_terminate: ForceTerminateArgsSchema,
   list_sessions: ListSessionsArgsSchema,
   list_processes: ListProcessesArgsSchema,
