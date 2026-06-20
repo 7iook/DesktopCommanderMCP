@@ -471,19 +471,8 @@ export class TerminalManager {
             output = output.slice(-Math.floor(MAX_WAIT_OUTPUT_CHARS / 2));
           }
         }
-        // Append to line-based buffer (CLIXML-filtered at the boundary for PS).
-        // Wrapped: a throw here runs inside a stream 'data' emitter, which would
-        // become an uncaughtException and (historically) kill the whole server,
-        // wedging every tool call until the MCP host is restarted. Never let
-        // output processing crash the process — drop to raw append, then bail.
-        try {
-          this.appendToLineBuffer(session, this.filterCliXmlStream(session, text));
-        } catch (procErr) {
-          try {
-            this.appendToLineBuffer(session, text);
-            console.error(`output processing error (recovered): ${procErr instanceof Error ? procErr.message : String(procErr)}`);
-          } catch { /* last-resort: swallow so the stream never crashes the process */ }
-        }
+        // Append to line-based buffer (CLIXML-filtered at the boundary for PS)
+        this.appendToLineBuffer(session, this.filterCliXmlStream(session, text));
 
         // Record output event if collecting timing
         if (collectTiming) {
@@ -526,19 +515,8 @@ export class TerminalManager {
             output = output.slice(-Math.floor(MAX_WAIT_OUTPUT_CHARS / 2));
           }
         }
-        // Append to line-based buffer (CLIXML-filtered at the boundary for PS).
-        // Wrapped: a throw here runs inside a stream 'data' emitter, which would
-        // become an uncaughtException and (historically) kill the whole server,
-        // wedging every tool call until the MCP host is restarted. Never let
-        // output processing crash the process — drop to raw append, then bail.
-        try {
-          this.appendToLineBuffer(session, this.filterCliXmlStream(session, text));
-        } catch (procErr) {
-          try {
-            this.appendToLineBuffer(session, text);
-            console.error(`output processing error (recovered): ${procErr instanceof Error ? procErr.message : String(procErr)}`);
-          } catch { /* last-resort: swallow so the stream never crashes the process */ }
-        }
+        // Append to line-based buffer (CLIXML-filtered at the boundary for PS)
+        this.appendToLineBuffer(session, this.filterCliXmlStream(session, text));
 
         // Record output event if collecting timing
         if (collectTiming) {
