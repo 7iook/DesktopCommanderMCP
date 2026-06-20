@@ -71,40 +71,43 @@ async function runServer() {
       // Continue anyway - we'll use an in-memory config
     }
 
-    // Handle uncaught exceptions
+    // Handle uncaught exceptions.
+    // CRITICAL: do NOT process.exit() here. A single recoverable throw from one
+    // tool path (e.g. an output-processing edge case, an EPIPE writing to a
+    // stdout the client already closed after a timeout, a transient fs error)
+    // must NOT kill the whole stdio server — when it does, the MCP host (e.g.
+    // mcphub) does not auto-respawn the stdio child, so EVERY subsequent tool
+    // call hangs until the host is manually restarted. Log full error+stack to
+    // stderr (the host captures it) and keep running.
     process.on('uncaughtException', async (error) => {
       const errorMessage = error instanceof Error ? error.message : String(error);
+      const stack = error instanceof Error && error.stack ? error.stack : '(no stack)';
 
-      // If this is a JSON parsing error, log it to stderr but don't crash
       if (errorMessage.includes('JSON') && errorMessage.includes('Unexpected token')) {
         logger.error(`JSON parsing error: ${errorMessage}`);
-        return; // Don't exit on JSON parsing errors
+        return;
       }
 
-      capture('run_server_uncaught_exception', {
-        error: errorMessage
-      });
-
-      logger.error(`Uncaught exception: ${errorMessage}`);
-      process.exit(1);
+      capture('run_server_uncaught_exception', { error: errorMessage });
+      try { process.stderr.write(`[desktop-commander] uncaughtException (kept alive): ${errorMessage}\n${stack}\n`); } catch { /* ignore */ }
+      logger.error(`Uncaught exception (kept alive): ${errorMessage}`);
+      // Intentionally NOT exiting — survive so the server stays usable.
     });
 
-    // Handle unhandled rejections
+    // Handle unhandled rejections — same rationale: keep the server alive.
     process.on('unhandledRejection', async (reason) => {
       const errorMessage = reason instanceof Error ? reason.message : String(reason);
+      const stack = reason instanceof Error && reason.stack ? reason.stack : '(no stack)';
 
-      // If this is a JSON parsing error, log it to stderr but don't crash
       if (errorMessage.includes('JSON') && errorMessage.includes('Unexpected token')) {
         logger.error(`JSON parsing rejection: ${errorMessage}`);
-        return; // Don't exit on JSON parsing errors
+        return;
       }
 
-      capture('run_server_unhandled_rejection', {
-        error: errorMessage
-      });
-
-      logger.error(`Unhandled rejection: ${errorMessage}`);
-      process.exit(1);
+      capture('run_server_unhandled_rejection', { error: errorMessage });
+      try { process.stderr.write(`[desktop-commander] unhandledRejection (kept alive): ${errorMessage}\n${stack}\n`); } catch { /* ignore */ }
+      logger.error(`Unhandled rejection (kept alive): ${errorMessage}`);
+      // Intentionally NOT exiting.
     });
 
     capture('run_server_start');
