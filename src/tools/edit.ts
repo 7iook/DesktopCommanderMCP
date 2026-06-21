@@ -699,7 +699,15 @@ export async function editBlockMultiple(edits: MultiEditInput[]): Promise<Server
                         try {
                             const fuzzy = await runFuzzySearchInWorker(running, ed.old_string);
                             const sim = getSimilarityRatio(ed.old_string, fuzzy.value);
-                            hint = `closest ${Math.round(sim * 100)}% match:\n${extractContextAround(running, fuzzy.value)}`;
+                            // High similarity + no exact match ≈ a line-ending (CRLF/LF) or
+                            // trailing-whitespace diff, not a content diff (diff looks empty,
+                            // very confusing). Detect and give an actionable fix.
+                            let eolNote = '';
+                            if (sim >= 0.95) {
+                                const canon = (s: string) => s.replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, '');
+                                if (canon(ed.old_string) === canon(fuzzy.value)) eolNote = ' — ⚠️ content is IDENTICAL except line endings / trailing whitespace (this file has mixed CRLF/LF). Fix: use a SHORTER single-line old_string with NO internal newline (immune to EOL normalization), or copy the exact bytes below';
+                            }
+                            hint = `closest ${Math.round(sim * 100)}% match:${eolNote}\n${extractContextAround(running, fuzzy.value)}`;
                         } catch { /* hint is best-effort */ }
                     } else {
                         reason = `found ${res.count} occurrence(s) but expected ${expected} — set expected_replacements=${res.count} or make old_string more unique`;
@@ -747,10 +755,20 @@ export async function editBlockMultiple(edits: MultiEditInput[]): Promise<Server
             const failed = o.editResults.filter(r => !r.ok);
             const head = o.error
                 ? `❌ ${o.file_path} — ${o.error} (file unchanged)`
-                : `❌ ${o.file_path} — ${failed.length} edit(s) failed, file left unchanged (per-file atomic)`;
+                : `❌ ${o.file_path} — ${failed.length} of ${o.editResults.length} edit(s) failed; file left UNCHANGED (per-file atomic — NOTHING saved, including edits that matched)`;
             lines.push(head);
+            // Edits that matched in memory but were NOT written because a later
+            // edit in the same file failed (per-file atomic rollback). Surfacing
+            // these is critical: otherwise the model assumes they applied and
+            // wastes turns grepping to "verify" a change that was never saved.
+            const rolledBack = o.editResults.filter(r => r.ok);
+            if (rolledBack.length > 0) {
+                const ids = rolledBack.map(r => `#${r.index + 1}`).join(', ');
+                lines.push(`   • edit ${ids} MATCHED but were ROLLED BACK (not saved). Do NOT assume they applied — re-send them with the corrected failed edit(s) in one call.`);
+                if (failed.some(r => r.count === 0)) lines.push(`     ↳ Note: edits apply sequentially in memory — a later edit matches the file AFTER earlier edits. If old_string was copied from the original file, account for those or split into separate calls.`);
+            }
             for (const r of failed) {
-                lines.push(`   • edit #${r.index + 1}: ${r.reason}`);
+                lines.push(`   • edit #${r.index + 1} FAILED: ${r.reason}`);
                 if (r.hint) lines.push(`     ↳ ${r.hint.replace(/\n/g, '\n       ')}`);
             }
         }
