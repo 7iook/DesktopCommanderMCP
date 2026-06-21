@@ -828,8 +828,17 @@ export class TerminalManager {
     if (offset < 0) {
       // Negative offset = start position from end, then read 'length' lines forward
       // e.g., offset=-50, length=10 means: start 50 lines from end, read 10 lines
+      //
+      // Ignore a single trailing empty element when computing the tail anchor.
+      // appendToLineBuffer splits on '\n', so output ending in a newline always
+      // leaves a final '' element (the not-yet-written current line). Without
+      // this, offset=-1 returns that empty string → "(No output in requested
+      // range)" even though real lines exist — the #1 reason live-tail and
+      // post-finish tail reads came back blank (reported P1/P6, offset=-1).
+      let effEnd = totalLines;
+      if (effEnd > 0 && lines[effEnd - 1] === '') effEnd--;
       const fromEnd = Math.abs(offset);
-      startIndex = Math.max(0, totalLines - fromEnd);
+      startIndex = Math.max(0, effEnd - fromEnd);
       linesToRead = lines.slice(startIndex, startIndex + length);
       // Don't update lastReadIndex for tail reads
     } else if (offset === 0) {
@@ -873,6 +882,40 @@ export class TerminalManager {
     const completedSession = this.completedSessions.get(pid);
     if (completedSession) {
       return completedSession.outputLines.length;
+    }
+
+    return null;
+  }
+
+  /**
+   * Total chars emitted by a process since start (evicted + retained),
+   * monotonically increasing. O(1) — reads the running counters, never joins.
+   *
+   * Why this exists (follow_ms responsiveness, see read_process_output): the
+   * tail-follow wait used to poll getOutputLineCount, which only increments on
+   * a COMPLETE new line. Processes that update in place (`\r` progress bars,
+   * spinners) or emit partial lines without a trailing newline never bumped
+   * the line count, so follow_ms sat idle until the next newline — appearing
+   * to "hang" even though bytes were arriving. Char count moves on ANY new
+   * output, so follow resolves promptly on partial-line activity too.
+   *
+   * NOTE: this does not and cannot fix child-side block buffering — a process
+   * whose libc fully buffers stdout/stderr to a pipe (no TTY) still flushes in
+   * bursts; that requires a PTY, which this transport does not allocate.
+   */
+  getOutputCharCount(pid: number): number | null {
+    const session = this.sessions.get(pid);
+    if (session) {
+      return session.evictedChars + session.bufferedChars;
+    }
+
+    const completedSession = this.completedSessions.get(pid);
+    if (completedSession) {
+      // Completed sessions don't retain bufferedChars; approximate from the
+      // retained buffer length + evicted chars (sufficient for follow, which
+      // only targets active sessions anyway).
+      const joinedLen = completedSession.outputLines.join('\n').length;
+      return completedSession.evictedChars + joinedLen;
     }
 
     return null;

@@ -73,6 +73,19 @@ export const InteractWithProcessLineItemSchema = z.object({
   // Escape hatch: instead of waiting for a prompt, just sleep this many ms
   // after sending (for processes whose prompt can't be regex-detected).
   delay_after_ms: z.number().optional(),
+  // Divergence guard (regex SOURCE). After this step's wait resolves, the
+  // newly-printed output is checked against these. Without them, a step is
+  // considered "ok" the moment its tail merely LOOKS like a prompt — so a
+  // flow that fell back to the main menu (which also ends in a prompt char)
+  // is mistaken for success and the remaining lines get fed into the wrong
+  // context. These let a step assert WHERE it landed.
+  //   expect:   new output MUST match, else the step is treated as diverged.
+  //   abort_if: new output matching this stops the run immediately, even if
+  //             the tail looks like a valid prompt (e.g. "Invalid option",
+  //             "Returning to main menu", "Operation cancelled").
+  // A diverged/aborted step stops the run when fail_fast is on (default).
+  expect: z.string().optional(),
+  abort_if: z.string().optional(),
 });
 
 // interact_with_process_lines: expect/spawn-style sequential input.
@@ -85,7 +98,8 @@ export const InteractWithProcessLinesArgsSchema = z.object({
   pid: z.number(),
   lines: z.array(InteractWithProcessLineItemSchema).min(1),
   // Default regex SOURCE used when a line has no own wait_for. Falsey ->
-  // built-in prompt regex (`[:?>#$]\s*$|\)\s*$`).
+  // built-in prompt regex (`[:?>#$\]]\s*$|\)\s*$`, i.e. ends with : ? > # $ ]
+  // or a closing paren).
   default_wait_for: z.string().optional(),
   // Default per-line wait cap (ms).
   default_timeout_ms: z.number().optional().default(5000),

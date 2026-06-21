@@ -374,7 +374,7 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
   const cappedOutput = applyResponseCharCap(
     result.output,
     initialCap,
-    `use read_process_output(pid=${result.pid}, offset=0|negative) to read more`
+    `the EARLIER output was dropped (tail kept) but is fully retained in the buffer — read it with read_process_output(pid=${result.pid}, offset=0, length=N) and page forward with a positive line offset`
   );
 
   return {
@@ -444,19 +444,31 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
   // For active sessions with no new output yet, optionally wait for output
   const session = terminalManager.getSession(pid);
 
-  // tail -f follow for absolute/tail reads (offset !== 0). After the page is
-  // computed below, this waits for NEW lines to be appended. We capture the
-  // baseline line count BEFORE the wait so we only resolve on genuinely new
-  // output. For offset === 0 the existing "new output" wait already covers
-  // this, and follow_ms (if given) extends that window.
+  // tail -f follow for absolute/tail reads (offset !== 0). This waits for NEW
+  // output to be appended, then falls through to the normal read below. For
+  // offset === 0 the existing "new output" wait already covers this.
+  //
+  // Trigger on CHAR count, not line count: a process updating in place (`\r`
+  // progress bars) or printing a partial line without a trailing newline never
+  // bumps the line count, so the old line-based wait sat idle until the next
+  // newline — looking like follow_ms was ignored. (Child-side block buffering
+  // — a process whose libc fully buffers stdout to a pipe because it's not a
+  // TTY, or output redirected away from the pipe entirely — is a separate
+  // issue this cannot fix without a PTY, which this transport does not allocate.)
+  //
+  // A NEGATIVE offset stays a TRUE tail of the CURRENT buffer on every call
+  // (per the documented contract: offset<0 = "last N lines now", offset=0 =
+  // gapless cursor-based follow). We deliberately do NOT rebase it to an
+  // absolute cursor here — doing so both breaks the "always tail" contract and
+  // strands the read on the empty trailing line.
   if (session && follow_ms && follow_ms > 0 && offset !== 0) {
-    const baseline = terminalManager.getOutputLineCount(pid) || 0;
+    const charBaseline = terminalManager.getOutputCharCount(pid) || 0;
     await new Promise<void>((resolve) => {
       let done = false;
       const finish = () => { if (done) return; done = true; clearInterval(iv); clearTimeout(to); resolve(); };
       const iv = setInterval(() => {
-        const now = terminalManager.getOutputLineCount(pid) || 0;
-        if (now > baseline || !terminalManager.getSession(pid)) finish();
+        const now = terminalManager.getOutputCharCount(pid) || 0;
+        if (now > charBaseline || !terminalManager.getSession(pid)) finish();
       }, 50);
       const to = setTimeout(finish, follow_ms);
     });
@@ -508,7 +520,9 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
     await waitForOutput();
   }
 
-  // Read output with pagination
+  // Read output with pagination. offset<0 is a true tail of the current
+  // buffer; offset=0 is cursor-based (advances lastReadIndex); offset>0 is
+  // absolute. The trailing empty-line artifact is handled inside readOutputPaginated.
   const result = terminalManager.readOutputPaginated(pid, offset, length);
   
   if (!result) {
@@ -578,7 +592,7 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
   const cappedResponse = applyResponseCharCap(
     responseText,
     responseMaxChars,
-    `request a smaller length or a different offset for the rest`
+    `this page's earlier chars were dropped (tail kept); the lines are still in the buffer — re-read this range with a smaller length, or address it directly via read_process_output(pid=${pid}, offset=${result.readFrom}, length=N)`
   );
 
   return {
@@ -869,7 +883,7 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
       cleanOutput = applyResponseCharCap(
         cleanOutput,
         responseMaxChars,
-        `use read_process_output(pid=${pid}) for the rest`
+        `the earlier output was dropped (tail kept) but is fully retained in the buffer — read it with read_process_output(pid=${pid}, offset=0, length=N) and page forward with a positive line offset`
       );
     }
     
@@ -958,11 +972,15 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
 
 /**
  * Built-in prompt regex used when no wait_for is supplied. Matches a line
- * that ends with a typical prompt sentinel (colon / question / >, #, $) or a
- * closing paren, optionally followed by trailing whitespace. Tested against
- * the LAST line of the newly-printed output only.
+ * that ends with a typical prompt sentinel (colon / question / >, #, $), a
+ * closing paren, or a closing bracket, optionally followed by trailing
+ * whitespace. Tested against the LAST line of the newly-printed output only.
+ *
+ * `]` is included so bracketed choice prompts that don't end in a colon match
+ * out of the box — e.g. `Overwrite? [y/N]`, `Select [0-4]`, `(default) [yes]`.
+ * (Forms like `[0-4]:` already matched via the trailing `:`.)
  */
-const DEFAULT_PROMPT_REGEX_SOURCE = '[:?>#$]\\s*$|\\)\\s*$';
+const DEFAULT_PROMPT_REGEX_SOURCE = '[:?>#$\\]]\\s*$|\\)\\s*$';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1086,6 +1104,23 @@ export async function interactWithProcessLines(args: unknown): Promise<ServerRes
     }
 
     const lineOut = lineSnapshot ? (terminalManager.getOutputSinceSnapshot(pid, lineSnapshot) ?? '') : '';
+
+    // Divergence guards: assert WHERE we landed, not just that the tail looks
+    // like a prompt. Without these, a flow that bounced back to the main menu
+    // (also prompt-shaped) is mistaken for success and the rest of the lines
+    // get fed into the wrong context. Invalid regex sources are ignored so a
+    // bad guard never silently swallows a real step.
+    if (matched && line.abort_if) {
+      try {
+        if (new RegExp(line.abort_if, 'm').test(lineOut)) { matched = false; reason = 'abort_if'; }
+      } catch { /* invalid abort_if regex — skip guard */ }
+    }
+    if (matched && line.expect) {
+      try {
+        if (!new RegExp(line.expect, 'm').test(lineOut)) { matched = false; reason = 'expect-missed'; }
+      } catch { /* invalid expect regex — skip guard */ }
+    }
+
     if (collect_output === 'per_line') {
       // Bound per-step output so a chatty step can't flood context.
       const capped = lineOut.length > 4000 ? lineOut.slice(0, 4000) + '\n…[truncated]' : lineOut;
@@ -1097,6 +1132,23 @@ export async function interactWithProcessLines(args: unknown): Promise<ServerRes
     if (!matched && reason === 'timeout' && fail_fast) {
       aborted = true;
       abortReason = `Line ${i + 1} timed out after ${lineTimeout}ms waiting for prompt (/${re.source}/). Stopped (fail_fast).`;
+      break;
+    }
+    // abort_if fired: an explicit danger pattern matched. Stop regardless of
+    // fail_fast — the caller opted into "if you see this, definitely stop".
+    if (reason === 'abort_if') {
+      aborted = true;
+      const tail = lineOut.slice(-200).replace(/\s+$/, '');
+      abortReason = `Line ${i + 1} hit abort_if (/${line.abort_if}/) — flow diverged, stopped before feeding the rest. Landed on: …${JSON.stringify(tail)}`;
+      break;
+    }
+    // expect missed: we got a prompt but not the one we required. Treat like a
+    // timeout w.r.t. fail_fast (default stop) so we don't feed the rest into a
+    // wrong context, but allow fail_fast:false to power through.
+    if (reason === 'expect-missed' && fail_fast) {
+      aborted = true;
+      const tail = lineOut.slice(-200).replace(/\s+$/, '');
+      abortReason = `Line ${i + 1} did not match expect (/${line.expect}/) — landed somewhere unexpected, stopped (fail_fast). Got: …${JSON.stringify(tail)}`;
       break;
     }
     if (reason === 'process-exited') {
@@ -1125,7 +1177,7 @@ export async function interactWithProcessLines(args: unknown): Promise<ServerRes
   }
   const responseMaxChars = config.responseMaxChars ?? 50000;
   if (cleanOutput.length > responseMaxChars) {
-    cleanOutput = applyResponseCharCap(cleanOutput, responseMaxChars, `use read_process_output(pid=${pid}) for the rest`);
+    cleanOutput = applyResponseCharCap(cleanOutput, responseMaxChars, `the earlier output was dropped (tail kept) but is fully retained in the buffer — read it with read_process_output(pid=${pid}, offset=0, length=N) and page forward with a positive line offset`);
   }
 
   const processState = analyzeProcessState(aggregateRaw, pid);
