@@ -260,8 +260,63 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
     };
   }
 
+  // === Pre-execution: detect & auto-rewrite `pwsh/powershell -Command "..."`
+  // wrappers carrying $variables. The outer shell (PowerShell) expands
+  // $_/$env:*/$var inside the double-quoted argument BEFORE the inner
+  // powershell sees them — so `$_.Name` becomes `.Name` and inner fails.
+  // We extract the inner script and run that directly. Match only DOUBLE-
+  // quoted wrappers (single-quoted ones don't expand $_, false positive).
+  // Conservative: if quoting is ambiguous (no clean closing `"`, or extra
+  // tokens after), don't rewrite — just keep the hint.
+  const PS_NESTED_WRAPPER = /^\s*(?:powershell|pwsh)(?:\.exe)?\s+(?:-\w+\s+)*-c(?:ommand)?\s+"/i;
+  // Auto-rewrite is only safe when the OUTER shell is already PowerShell —
+  // stripping the wrapper would otherwise leave PS syntax for cmd/bash to
+  // parse (`$env:X='1'` is meaningless to cmd → "syntax incorrect"). On
+  // Windows the default shell is PowerShell, so unspecified shell is treated
+  // as PS-friendly; cmd/bash/etc. fall through to hint-only mode.
+  const shellBase = (shellUsed && typeof shellUsed === 'string')
+    ? path.basename(shellUsed).toLowerCase().replace(/\.exe$/, '')
+    : '';
+  const outerIsPowerShell = !shellBase || shellBase === 'powershell' || shellBase === 'pwsh';
+  let commandToRunEffective = commandToRun;
+  let nestedHint = '';
+  if (PS_NESTED_WRAPPER.test(commandToRun) && /\$[_\w:]/.test(commandToRun)) {
+    const m = /^\s*(?:powershell|pwsh)(?:\.exe)?\s+((?:-\w+\s+)*)-c(?:ommand)?\s+"([\s\S]*)$/i.exec(commandToRun);
+    let rewritten: string | null = null;
+    if (m && outerIsPowerShell) {
+      const body = m[2];
+      // Walk for the closing `"`, respecting PS backtick escape and doubled-quote.
+      let end = -1, trailing = '';
+      for (let i = 0; i < body.length; i++) {
+        const c = body[i];
+        if (c === '`') { i++; continue; }
+        if (c === '"' && body[i + 1] === '"') { i++; continue; }
+        if (c === '"') { end = i; trailing = body.slice(i + 1); break; }
+      }
+      if (end >= 0 && !trailing.trim() && body.slice(0, end).trim()) {
+        rewritten = body.slice(0, end);
+      }
+    }
+    if (rewritten) {
+      commandToRunEffective = rewritten;
+      nestedHint =
+        `\n\nℹ️ Auto-rewritten: stripped nested \`pwsh/powershell -Command "..."\` wrapper containing $variables.\n` +
+        `The outer shell would have expanded $_/$env:*/$var before the inner powershell saw them.\n` +
+        `Your inner script ran directly in the PowerShell shell (same effect, no double-parse).\n` +
+        `For next time, drop the wrapper yourself: just write the PS expression.\n`;
+    } else {
+      nestedHint =
+        `\n\n⚠️ Anti-pattern HINT — your command DID execute as-is (auto-rewrite skipped, ambiguous quoting):\n` +
+        `Nested \`pwsh/powershell -Command "..."\` wrapper containing $variables.\n` +
+        `The OUTER shell expanded $_/$env:*/$var inside the double-quoted argument BEFORE\n` +
+        `the inner powershell saw them — that's why $_.Name becomes .Name.\n` +
+        `Fix: drop the wrapper. Bad: \`powershell -Command "Get-Process | %{$_.Name}"\`\n` +
+        `Good: \`Get-Process | %{ $_.Name }\`\n`;
+    }
+  }
+
   const result = await terminalManager.executeCommand(
-    commandToRun,
+    commandToRunEffective,
     parsed.data.timeout_ms,
     shellUsed,
     parsed.data.verbose_timing || false,
@@ -269,48 +324,13 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
     parsed.data.env
   );
 
-  // Detect a recurring AI anti-pattern: nesting `powershell -Command "..."`
-  // (or `pwsh -Command "..."`) inside a command that is ALREADY going to run
-  // through a PowerShell shell. The outer shell expands $_ / $env:* / $var
-  // INSIDE the double-quoted argument before handing the string to the inner
-  // powershell, so `$_.Name` becomes `.Name` and the inner command fails with
-  // mass "The term '.Name' is not recognized" errors.
-  //
-  // We don't auto-strip the wrapper — silent rewriting of user commands is
-  // worse than the original bug — but we do flag it so the AI doesn't go off
-  // building a .ps1 workaround thinking the transport layer ate $_ (it didn't;
-  // commit 14321fc fixed transport-level $_ swallowing via -EncodedCommand).
-  // Match only DOUBLE-quoted nested wrapper. Single-quoted wrappers
-  // (`powershell -Command '...'`) don't expand $_ and run correctly even
-  // though the wrapper itself is unnecessary — flagging those would be
-  // a false positive.
-  const PS_NESTED_WRAPPER = /^\s*(?:powershell|pwsh)(?:\.exe)?\s+(?:-\w+\s+)*-c(?:ommand)?\s+"/i;
-  // Detect another common Windows trap: `cmd /c timeout /t N` (or bare
-  // `timeout /t N`, or `cmd /c "timeout /t N ..."`). timeout.exe needs a
-  // real console handle that desktop-commander's piped stdio shell does
-  // NOT provide, so it bails out immediately with "ERROR: Input
-  // redirection is not supported" and any commands chained after it run
-  // with zero wait — the equivalent of `Start-Sleep` not happening at
-  // all. Only a recommendation; we do not rewrite the command.
-  // \b matches a word boundary before `timeout`, so it fires whether the
-  // preceding char is whitespace, `"`, `'`, `&`, `|`, `;`, or string
-  // start. Trailing `\s+/t\s+\d+` keeps the hint scoped to the actual
-  // trap (timeout WITH /t flag) rather than incidental "timeout" tokens
-  // in paths or other commands.
+  // Detect a recurring AI anti-pattern: `cmd /c timeout /t N`. timeout.exe
+  // needs a real console handle that desktop-commander's piped stdio shell
+  // does NOT provide; it bails out and any chained commands run with zero
+  // wait — the sleep didn't happen. Only a hint; we don't rewrite.
   const CMD_TIMEOUT_TRAP = /\btimeout(?:\.exe)?\s+\/t\s+\d+/i;
-  let antiPatternHint = '';
-  if (PS_NESTED_WRAPPER.test(commandToRun) && /\$[_\w:]/.test(commandToRun)) {
-    antiPatternHint =
-      `\n\n⚠️ Anti-pattern HINT — your command DID execute as-is, this is just guidance:\n` +
-      `Nested \`powershell/pwsh -Command "..."\` wrapper containing $variables.\n` +
-      `desktop-commander already runs your command in a PowerShell shell. The OUTER shell expands\n` +
-      `$_ / $env:* / $var inside the double-quoted argument BEFORE passing the string to the inner\n` +
-      `powershell — that's why $_.Name becomes .Name and the inner pipeline fails.\n` +
-      `Fix: drop the wrapper. (transport-level $_ swallowing was already fixed in commit 14321fc;\n` +
-      `you don't need a temp .ps1 workaround unless the command genuinely requires it.)\n` +
-      `  Bad:  powershell -Command "Get-Process | %{ $_.Name }"\n` +
-      `  Good: Get-Process | %{ $_.Name }\n`;
-  }
+
+  let antiPatternHint = nestedHint;
   if (CMD_TIMEOUT_TRAP.test(commandToRun)) {
     antiPatternHint +=
       `\n\n⚠️ Anti-pattern HINT — your command DID execute as-is, this is just guidance:\n` +

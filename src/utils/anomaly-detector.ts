@@ -93,10 +93,10 @@ const RULES: Rule[] = [
   },
   {
     id: 'ps_nested_var_swallowed',
-    description: 'Nested `powershell -Command "..."` with $variable — outer shell expands $_ before inner sees it',
+    description: 'Nested `powershell -Command "..."` with $variable — outer shell expands $_ before inner sees it (auto-rewritten by start_process when quoting is unambiguous)',
     severity: 'warn',
     appliesTo: ['start_process'],
-    suggestion: 'Drop the wrapper: write the PowerShell expression directly, no outer powershell -Command',
+    suggestion: 'Drop the wrapper: write the PowerShell expression directly. The tool now auto-strips obvious wrappers, but the AI still keeps writing them — break the habit.',
     match: (r) => {
       const cmd = (r.arguments as any)?.command ?? '';
       const NESTED = /^\s*(?:powershell|pwsh)(?:\.exe)?\s+(?:-\w+\s+)*-c(?:ommand)?\s+"/i;
