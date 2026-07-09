@@ -371,6 +371,20 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
     processState.isRunning = true;
   }
 
+  // Symmetric OS-level override for the OPPOSITE mislabel: the text heuristic
+  // says "waiting for input" but the PID is already dead. A dead process
+  // cannot be blocked on stdin, so this is always a false positive (a prompt
+  // char like `>` / `... ` left in the final output of a one-shot command).
+  // Left uncorrected it produces the exact contradiction users hit: the tool
+  // reports "waiting for input", the AI calls force_terminate, and gets
+  // "No active session" because the process exited and its session already
+  // moved to completedSessions. Trust the OS: not alive ⇒ finished.
+  if (processState.isWaitingForInput && !isPidAlive(result.pid)) {
+    processState.isWaitingForInput = false;
+    processState.isFinished = true;
+    processState.isRunning = false;
+  }
+
   let statusMessage = '';
   if (processState.isWaitingForInput) {
     statusMessage = `\n🔄 ${formatProcessStateMessage(processState, result.pid)}`;

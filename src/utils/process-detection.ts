@@ -115,11 +115,24 @@ function analyzeProcessStateImpl(output: string, pid?: number): ProcessState {
   // "still printing log lines". App-level prompt patterns only match here.
   const cursorOnPartialLine = !output.endsWith('\n') && lastLine.length > 0;
 
-  // Check for REPL prompts (waiting for input)
+  // Check for REPL prompts (waiting for input). Gated on cursorOnPartialLine:
+  // a real REPL parks the cursor on the prompt WITHOUT a trailing newline
+  // ("waiting for input" == the write is incomplete). Requiring a partial
+  // line — and matching only at the END of that line, not anywhere in it —
+  // stops false positives on ordinary tool output that merely CONTAINS these
+  // characters mid-stream. The two high-frequency offenders on Windows+Rust:
+  //   - `cargo test`  prints "test some::name ... ok\n"  → the "... " is a
+  //     progress marker, followed by "ok" and a newline, never a real prompt.
+  //   - clippy/rustc  emit "-->" locators and "help:" hints ending in ">"
+  //     inside diagnostics that DO end in a newline.
+  // Both used to trip `lastLine.includes('... ' | '> ')` and get mislabeled
+  // "waiting for input" — the tool then reported a live prompt on a process
+  // that had already exited (see the force_terminate "No active session"
+  // mismatch). endsWith + partial-line gate removes that whole class.
   const allPrompts = Object.values(REPL_PROMPTS).flat();
-  const detectedPrompt = allPrompts.find(prompt =>
-    lastLine.endsWith(prompt) || lastLine.includes(prompt)
-  );
+  const detectedPrompt = cursorOnPartialLine
+    ? allPrompts.find(prompt => lastLine.endsWith(prompt))
+    : undefined;
 
   if (detectedPrompt) {
     return {
