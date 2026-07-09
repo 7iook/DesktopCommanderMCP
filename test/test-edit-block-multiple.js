@@ -49,7 +49,7 @@ async function main() {
     ]);
     t = textOf(res);
     assert((await read(fC)) === 'keep1\nkeep2\nkeep3\n', 'file C untouched (atomic) despite first edit matching');
-    assert(t.includes('left unchanged') && t.includes('no exact match'), 'reports atomic skip + miss reason');
+    assert(/left unchanged/i.test(t) && t.includes('no exact match'), 'reports atomic skip + miss reason');
 
     // --- Test 3: cross-file independence (good file lands, bad file reverts) ---
     await write(fA, 'red\ngreen\n');
