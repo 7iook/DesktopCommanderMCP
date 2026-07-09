@@ -1,7 +1,11 @@
 import { z } from "zod";
 
 // Config tools schemas
-export const GetConfigArgsSchema = z.object({});
+export const GetConfigArgsSchema = z.object({
+  // 'ui' marks calls the config-editor widget fires programmatically; they are
+  // excluded from tool-call telemetry (see isUiOriginCall in server.ts).
+  origin: z.enum(['ui', 'llm']).optional(),
+});
 
 export const SetConfigValueArgsSchema = z.object({
   key: z.string(),
@@ -12,6 +16,7 @@ export const SetConfigValueArgsSchema = z.object({
     z.array(z.string()),
     z.null(),
   ]),
+  // 'ui' marks widget-fired calls; excluded from tool-call telemetry.
   origin: z.enum(['ui', 'llm']).optional(),
 });
 
@@ -37,6 +42,9 @@ export const StartProcessArgsSchema = z.object({
   // var (only set/override). Useful for one-off proxy / token / flag
   // injection without polluting the global env.
   env: z.record(z.string()).optional(),
+  // 'ui' marks widget-fired calls (e.g. open-in-folder/editor buttons);
+  // excluded from tool-call telemetry (see isUiOriginCall in server.ts).
+  origin: z.enum(['ui', 'llm']).optional(),
 });
 
 export const ReadProcessOutputArgsSchema = z.object({
@@ -136,7 +144,11 @@ export const ReadFileArgsSchema = z.object({
   length: z.number().optional().default(1000),
   sheet: z.string().optional(),  // String only for MCP client compatibility (Cursor doesn't support union types in JSON Schema)
   range: z.string().optional(),
-  options: z.record(z.any()).optional()
+  options: z.record(z.any()).optional(),
+  // Whether the call came from the file-preview UI (refresh/navigation) or the
+  // LLM. 'ui' calls are excluded from tool-call telemetry; see isUiOriginCall
+  // in server.ts.
+  origin: z.enum(['ui', 'llm']).optional(),
 });
 
 export const ReadMultipleFilesArgsSchema = z.object({
@@ -152,6 +164,9 @@ export const WriteFileArgsSchema = z.object({
   // silent full-file overwrites by AI clients that ignore prompt-level rules.
   // Disable globally via config: writeFileOverwriteProtection=false.
   allowOverwrite: z.boolean().optional().default(false),
+  // 'ui' when fired by the file-preview UI, else 'llm'. 'ui' calls are
+  // excluded from tool-call telemetry; see isUiOriginCall in server.ts.
+  origin: z.enum(['ui', 'llm']).optional(),
 });
 
 // Batch write: create/append multiple files in ONE tool call. The real
@@ -221,6 +236,9 @@ export const ListDirectoryArgsSchema = z.object({
   // doesn't auto-truncate). Defaults match read_file pagination semantics.
   offset: z.number().optional().default(0),
   limit: z.number().optional(),  // Default applied at handler from config.responseMaxEntries
+  // 'ui' when fired by the file-preview UI, else 'llm'. 'ui' calls are
+  // excluded from tool-call telemetry; see isUiOriginCall in server.ts.
+  origin: z.enum(['ui', 'llm']).optional(),
 });
 
 // Batch list multiple directories in one call. The list counterpart of
@@ -261,7 +279,10 @@ export const EditBlockArgsSchema = z.object({
   // Structured file range rewrite (Excel, etc.)
   range: z.string().optional(),
   content: z.any().optional(),
-  options: z.record(z.any()).optional()
+  options: z.record(z.any()).optional(),
+  // 'ui' when fired by the file-preview UI, else 'llm'. 'ui' calls are
+  // excluded from tool-call telemetry; see isUiOriginCall in server.ts.
+  origin: z.enum(['ui', 'llm']).optional(),
 }).refine(
   data => {
     // Helper to check if value is actually provided (not undefined, not empty string)
@@ -337,6 +358,9 @@ export const StartSearchArgsSchema = z.object({
   timeout_ms: z.number().optional(), // Match process naming convention
   earlyTermination: z.boolean().optional(), // Stop search early when exact filename match is found (default: true for files, false for content)
   literalSearch: z.boolean().optional().default(false), // Force literal string matching (-F flag) instead of regex
+  // 'ui' marks widget-fired calls (e.g. markdown link-target search);
+  // excluded from tool-call telemetry (see isUiOriginCall in server.ts).
+  origin: z.enum(['ui', 'llm']).optional(),
 });
 
 export const GetMoreSearchResultsArgsSchema = z.object({
