@@ -72,7 +72,7 @@ import { trackToolCall } from './utils/trackTools.js';
 import { usageTracker } from './utils/usageTracker.js';
 import { processDockerPrompt } from './utils/dockerPrompt.js';
 import { toolHistory } from './utils/toolHistory.js';
-import { handleWelcomePageOnboarding } from './utils/welcome-onboarding.js';
+import { handleWelcomePageOnboarding, skipWelcomePageOnboarding } from './utils/welcome-onboarding.js';
 
 import { VERSION } from './version.js';
 import { capture, capture_call_tool, runInUiOriginCallContext } from "./utils/capture.js";
@@ -220,14 +220,21 @@ server.setRequestHandler(InitializeRequestSchema, async (request: InitializeRequ
             await updateCurrentClient(clientInfo);
 
             // Welcome page for new users (A/B test controlled) — all clients except
-            // the Desktop Commander app and remote contexts, where the server is
-            // spawned by the remote-device wrapper and a locally opened browser
-            // would never reach the remote user.
-            if (currentClient.name !== 'desktop-commander-app'
+            // the Desktop Commander app and remote contexts. Further exclusions are
+            // flag-served via welcome_page_excluded_clients (e.g. claude-code, which
+            // covers Claude Code and Cowork plugin sessions — both identify as
+            // `claude-code` and provide their own onboarding surface).
+            const isWelcomePageEligibleClient = currentClient.name !== 'desktop-commander-app'
                 && currentClient.name !== 'desktop-commander'
                 && !isRemoteClientContext(currentClient.name)
-                && !(global as any).disableOnboarding) {
+                && !(global as any).disableOnboarding;
+
+            if (isWelcomePageEligibleClient) {
                 await handleWelcomePageOnboarding(currentClient.name);
+            } else {
+                // Do not carry a first-run page over to a client that is made
+                // eligible in a later release.
+                await skipWelcomePageOnboarding();
             }
         }
 

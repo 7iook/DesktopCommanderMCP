@@ -88,6 +88,16 @@ class ConfigManager {
         const configData = await fs.readFile(this.configPath, 'utf8');
         this.config = JSON.parse(configData);
         this._isFirstRun = false;
+
+        // Configs created before this marker existed must not receive the
+        // welcome page retroactively when client eligibility changes later.
+        // New configs get this field from getDefaultConfig() and remain
+        // eligible across restarts until their first initialization.
+        if (this.config['welcomeOnboardingEligible'] === undefined) {
+          this.config['welcomeOnboardingEligible'] = false;
+          this.config['pendingWelcomeOnboarding'] = false;
+          await this.saveConfig();
+        }
       } catch (error) {
         // Config file doesn't exist, create default
         this.config = this.getDefaultConfig();
@@ -181,7 +191,8 @@ class ConfigManager {
       writeFileOverwriteProtection: true, // Block silent full-file overwrites of existing files (caller must pass allowOverwrite=true)
       responseMaxChars: 50000,   // ~50KB cap for tool responses; prevents Kiro IDE context overflow
       initialOutputMaxChars: 16000, // ~16KB cap for start_process initial output; full output via read_process_output
-      pendingWelcomeOnboarding: true  // New install flag - triggers A/B test for welcome page
+      pendingWelcomeOnboarding: true, // New install flag - triggers A/B test for welcome page
+      welcomeOnboardingEligible: true // Distinguishes new installs from migrated legacy configs
     };
   }
 
@@ -190,9 +201,18 @@ class ConfigManager {
    * writeChain (see saveConfig / scheduleSave) so overlapping saves can never
    * interleave and corrupt the file. Previously every tool call could fire its
    * own independent fs.writeFile of the same path.
+   *
+   * ATOMIC: a plain fs.writeFile truncates the target before writing, so a
+   * process killed mid-write (IDE shutdown, taskkill, SIGTERM) left config.json
+   * as a 0-byte file and the user lost every setting. We write a pid-scoped temp
+   * file and rename it over the target instead: rename within a directory is
+   * atomic, so an interrupted write leaves the previous config fully intact.
    */
   private async writeConfigToDisk(): Promise<void> {
-    await fs.writeFile(this.configPath, JSON.stringify(this.config, null, 2), 'utf8');
+    const payload = JSON.stringify(this.config, null, 2);
+    const tempPath = `${this.configPath}.${process.pid}.tmp`;
+    await fs.writeFile(tempPath, payload, 'utf8');
+    await fs.rename(tempPath, this.configPath);
   }
 
   /**
