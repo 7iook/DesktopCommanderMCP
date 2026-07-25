@@ -288,6 +288,134 @@ class CommandManager {
             return false;
         }
     }
+
+    /**
+     * Detects "batch/mass kill by NAME" command patterns that risk collateral
+     * damage to mcphub's stdio MCP servers (which run under generic names like
+     * python.exe / node.exe / everything.exe and would be swept by name-based
+     * kills).
+     *
+     * Returns null when the command is safe or does not look like a kill at all.
+     * Returns a multi-line warning string (with mcphub whitelist + correct
+     * precise-PID usage) when a batch-kill pattern is detected. Callers should
+     * surface that string as an error response so the AI reads the guidance and
+     * retries with a targeted PID.
+     *
+     * NOT triggered by:
+     *   - taskkill /F /PID <n>
+     *   - Stop-Process -Id <n>
+     *   - Get-Process (query only)
+     *   - Get-CimInstance ... (query only, no delete/terminate)
+     */
+    checkBatchKillPattern(commandString: string): string | null {
+        if (!commandString) return null;
+        const s = commandString.trim();
+
+        // Rule 1: taskkill /IM (image-name mass kill) — the classic mcphub-killer
+        if (/\btaskkill\b/i.test(s)) {
+            const hasIM = /(^|\s)\/im(\s|:|=)/i.test(s);
+            const hasPID = /(^|\s)\/pid(\s|:|=)\s*\d+/i.test(s);
+            if (hasIM && !hasPID) {
+                return this.buildKillWarning(
+                    'taskkill /IM (kill by image name)',
+                    s,
+                    'Use `taskkill /F /PID <pid>` with a specific numeric PID. ' +
+                    'Discover PID first: `Get-CimInstance Win32_Process -Filter "Name=\'python.exe\'" | Select ProcessId,ExecutablePath,CommandLine | ft`.'
+                );
+            }
+        }
+
+        // Rule 2: Stop-Process -Name (PowerShell mass kill by name)
+        if (/\bStop-Process\b/i.test(s) && /(^|\s)-Name\b/i.test(s)) {
+            return this.buildKillWarning(
+                'Stop-Process -Name (kill by process name)',
+                s,
+                'Use `Stop-Process -Id <pid> -Force` with a specific numeric PID from Get-Process/Get-CimInstance.'
+            );
+        }
+
+        // Rule 3: pipeline into Stop-Process (Get-Process X | Stop-Process style)
+        // Safe if the piped source is a Get-Process -Id <n> that already narrows to PIDs.
+        if (/\|\s*Stop-Process\b/i.test(s)) {
+            const pipedSourceIsIdOnly = /Get-Process\s+-Id\s+\d+(\s*,\s*\d+)*\s*\|\s*Stop-Process\b/i.test(s);
+            if (!pipedSourceIsIdOnly) {
+                return this.buildKillWarning(
+                    'Get-Process | Stop-Process pipeline (mass kill)',
+                    s,
+                    'Never pipe a name-based Get-Process straight into Stop-Process. Inspect the list first, then `Stop-Process -Id <pid> -Force` for the exact PID(s).'
+                );
+            }
+        }
+
+        // Rule 4: pkill / killall (Linux/WSL — always match by name)
+        if (/(^|[\s;&|`(])\s*(pkill|killall)\b/i.test(s)) {
+            return this.buildKillWarning(
+                'pkill / killall (name-based mass kill)',
+                s,
+                'These match by name/regex and kill every match. Use `kill -9 <pid>` for a specific PID from `ps -ef | grep <thing>`.'
+            );
+        }
+
+        // Rule 5: wmic process ... delete | call terminate (without single PID)
+        if (/\bwmic\b[^\r\n]*\bprocess\b/i.test(s) && /\b(delete|call\s+terminate)\b/i.test(s)) {
+            const hasSinglePid = /\bprocessid\s*=\s*['\"]?\d+['\"]?/i.test(s) || /\bwhere\s+processid\s*=\s*\d+/i.test(s);
+            if (!hasSinglePid) {
+                return this.buildKillWarning(
+                    'wmic process ... delete/terminate (batch)',
+                    s,
+                    'wmic name-based delete sweeps every match. Prefer `taskkill /F /PID <pid>` with one PID.'
+                );
+            }
+        }
+
+        // Rule 6: Get-CimInstance ... | Remove-CimInstance (CIM version of mass kill)
+        if (/\|\s*Remove-CimInstance\b/i.test(s)) {
+            return this.buildKillWarning(
+                'Get-CimInstance | Remove-CimInstance (CIM mass kill)',
+                s,
+                'Query first with Get-CimInstance to find the exact ProcessId, then `Stop-Process -Id <pid> -Force` for that one PID only.'
+            );
+        }
+
+        return null;
+    }
+
+    private buildKillWarning(pattern: string, cmd: string, guidance: string): string {
+        return [
+            '⚠️ BATCH-KILL PATTERN DETECTED — aborted for MCP safety',
+            '',
+            `Pattern:  ${pattern}`,
+            `Command:  ${cmd}`,
+            '',
+            'WHY BLOCKED: This form kills processes by NAME and will collaterally kill',
+            'mcphub\'s stdio MCP servers running under generic names (python.exe / node.exe /',
+            'everything.exe / etc). That destroys the current AI session — every MCP tool',
+            '(desktop-commander, everything-search, fast-context, jshook, codegraph, ace-tool,',
+            'context7, exa, ...) goes down together.',
+            '',
+            `✅ CORRECT WAY: ${guidance}`,
+            '',
+            'MCPHUB WHITELIST — never kill a PID whose ExecutablePath or CommandLine contains',
+            'ANY of these substrings:',
+            '  • mcphub',
+            '  • desktop-commander    • DesktopCommanderMCP',
+            '  • mcp_server_everything_search / mcp-server-everything',
+            '  • fast-context / fast_context',
+            '  • jshook / @jshookmcp',
+            '  • codegraph',
+            '  • ace-tool / .ace-tool',
+            '  • E:\\MCP\\   (any subpath)',
+            '',
+            'REQUIRED WORKFLOW:',
+            '  1. Enumerate: Get-CimInstance Win32_Process -Filter "Name=\'<name>\'" | Select ProcessId,ExecutablePath,CommandLine | ft',
+            '  2. Report the list back to the user with PIDs and paths',
+            '  3. Confirm the target PID is NOT in the whitelist above',
+            '  4. Kill precisely: `taskkill /F /PID <pid>` OR `Stop-Process -Id <pid> -Force`',
+            '',
+            'If the user explicitly said "kill everything of type X including MCPs", ask for',
+            'confirmation and pass PIDs one by one — never fall back to name-based batch.'
+        ].join('\n');
+    }
 }
 
 export const commandManager = new CommandManager();

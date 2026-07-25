@@ -197,6 +197,17 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
     };
   }
 
+  // Batch-kill pattern hook: detect "kill by NAME" commands that would sweep
+  // mcphub's stdio MCP servers as collateral (python.exe / node.exe / etc.).
+  // Precise PID kills (taskkill /F /PID N, Stop-Process -Id N) are unaffected.
+  const batchKillWarning = commandManager.checkBatchKillPattern(parsed.data.command);
+  if (batchKillWarning) {
+    return {
+      content: [{ type: "text", text: batchKillWarning }],
+      isError: true,
+    };
+  }
+
   const commandToRun = parsed.data.command;
 
   // Handle node:local - runs Node.js code directly on MCP server

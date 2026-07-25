@@ -60,3 +60,14 @@
 - 现象: 本会话触发 ~7-10 次;实测均为 wrapper 内 `$var` 真被外层吞(非误报),hint 属实有用。纯 `Get-Process | %{...}`(不带外层 -Command wrapper)经核查不会触发。
 - 自动检测覆盖? 是(ps_nested_var_swallowed,本轮 10 hits)。
 - 状态: wontfix(行为符合预期;hint 仅在 `powershell -Command "..."` + `$var` 同时出现时触发)
+
+
+### A-003: write_multiple_files 同路径 rewrite+append 报全成功但 append 静默丢失
+- 日期 / 报告者: 2026-07-14 / JXai rca-gate
+- 工具: write_multiple_files
+- 环境: Windows 11 + mcphub desktop-commander MCP
+- 现象: 同一 `files` 数组含同路径 1 个 rewrite + 7 个 append，返回 `8 succeeded, 0 failed`；随后的 `inspect_file/read_file` 显示磁盘仅首块 17 行，7 个 append 全部未落盘。
+- 复现: 对新 Markdown 文件调用 `write_multiple_files`，同路径条目按 rewrite→append×7 排列；成功响应后立刻检查行数。
+- 推测根因: 文档声称同路径条目按 per-path mutex 串行，但实际批处理可能仍并发或最终写覆盖，且结果汇总未校验最终内容。
+- 自动检测覆盖? 无；`get_recent_anomalies` 未命中对应规则，工具调用也未返回 isError。
+- 状态: open（调用侧已改用单次 `write_file(mode=append)` 恢复内容）
