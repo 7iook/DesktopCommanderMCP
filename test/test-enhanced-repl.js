@@ -3,23 +3,34 @@ import { execSync } from 'child_process';
 import { startProcess, readProcessOutput, forceTerminate, interactWithProcess } from '../dist/tools/improved-process-tools.js';
 
 /**
- * Determines the correct python command to use
- * @returns {string} 'python3' or 'python'
+ * Determines the correct python command to use.
+ *
+ * Probe by RUNNING the interpreter, not by asking the shell whether the name
+ * resolves. Two independent reasons, both Windows:
+ *   1. `command -v` is a POSIX shell builtin. execSync on Windows spawns
+ *      cmd.exe, which has no such builtin, so the old probe threw
+ *      "Neither python3 nor python is available" on every Windows machine —
+ *      including ones with a perfectly good Python on PATH.
+ *   2. Swapping in `where` would not fix it either: Windows ships 0-byte
+ *      Microsoft Store "App Execution Alias" stubs for python.exe/python3.exe
+ *      in %LOCALAPPDATA%\Microsoft\WindowsApps. `where` resolves them happily,
+ *      but executing one exits 9009 without ever starting an interpreter.
+ * Running `<cmd> --version` is the only check that tells a real interpreter
+ * from a stub, and it needs no platform branching.
+ *
+ * @returns {string} the first working interpreter command
  */
 function getPythonCommand() {
-  try {
-    // Prefer python3 if available
-    execSync('command -v python3', { stdio: 'ignore' });
-    return 'python3';
-  } catch (e) {
-    // Fallback to python
+  const candidates = ['python3', 'python', 'py'];
+  for (const cmd of candidates) {
     try {
-      execSync('command -v python', { stdio: 'ignore' });
-      return 'python';
-    } catch (error) {
-      throw new Error('Neither python3 nor python command is available in the PATH');
+      execSync(`${cmd} --version`, { stdio: 'ignore' });
+      return cmd;
+    } catch (e) {
+      // Not present, or a Store stub that cannot execute — try the next one.
     }
   }
+  throw new Error(`No working Python interpreter found (tried: ${candidates.join(', ')})`);
 }
 
 
@@ -37,7 +48,12 @@ async function testEnhancedREPL() {
   const result = await startProcess({
     command: `${pythonCommand} -i`,
     timeout_ms: 10000,
-    shell: '/bin/bash'
+    // Only force bash where bash exists. Hardcoding '/bin/bash' made the spawn
+    // fail outright on Windows ("Failed to get process ID"), which is the same
+    // class of bug as the old `command -v` probe above. `python -i` is already
+    // interactive, so no particular shell is required — on Windows the
+    // configured default shell is the right choice.
+    ...(process.platform === 'win32' ? {} : { shell: '/bin/bash' })
   });
   
   console.log('Result from start_process:', result);

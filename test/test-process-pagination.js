@@ -99,13 +99,21 @@ async function testTailBehavior() {
   
   await wait(500);
   
-  // Read last 5 lines (output has 21 lines: line0-line19 + empty)
-  // Last 5 lines should include line16, line17, line18, line19
+  // The process prints 20 lines of CONTENT (line0..line19). Because the output
+  // ends in '\n', appendToLineBuffer leaves a trailing '' element in the buffer.
+  // The tail anchor deliberately ignores that empty element (see 071f6d7 —
+  // without it, offset:-1 returned only the empty string and every live-tail /
+  // post-finish tail read came back blank). So offset:-5 == the last 5 lines of
+  // content == line15..line19.
+  //
+  // This test previously asserted line16..line19 + '' (four real lines), which
+  // encoded the pre-071f6d7 off-by-one where the empty element was counted as a
+  // line. Asserting line14 is absent pins the window at exactly 5 content lines.
   const read = await readProcessOutput({ pid, offset: -5, timeout_ms: 1000 });
   assert(!read.isError, 'Read should succeed');
-  assert(read.content[0].text.includes('line16'), 'Should contain line16');
-  assert(read.content[0].text.includes('line19'), 'Should contain line19');
-  assert(!read.content[0].text.includes('line15'), 'Should NOT contain line15');
+  assert(read.content[0].text.includes('line15'), 'Should contain line15 (5th line from the end)');
+  assert(read.content[0].text.includes('line19'), 'Should contain line19 (last line)');
+  assert(!read.content[0].text.includes('line14'), 'Should NOT contain line14 (window is exactly 5 lines)');
   assert(read.content[0].text.includes('Reading last'), 'Status should indicate tail read');
   
   console.log('✅ Test 3 passed: Tail behavior works correctly');
