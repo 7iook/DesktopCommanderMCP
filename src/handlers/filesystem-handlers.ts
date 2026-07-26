@@ -332,6 +332,17 @@ interface WriteOutcome {
     error?: string;
 }
 
+/**
+ * Group key for batch writes. Must match the normalization used by the
+ * per-path write mutex (src/utils/file-mutex.ts) so that two spellings of the
+ * same file — `C:/foo` and `c:\foo` — are serialized together rather than
+ * racing each other.
+ */
+function groupKeyForPath(filePath: string): string {
+    const resolved = resolveAbsolutePath(filePath);
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
 async function writeOneFile(entry: WriteEntry, protectionEnabled: boolean, maxLines: number): Promise<WriteOutcome> {
     // Overwrite protection: rewrite of an existing file requires allowOverwrite.
     if (entry.mode === 'rewrite' && !entry.allowOverwrite && protectionEnabled) {
@@ -449,10 +460,11 @@ Disable this guard globally:
  * Handle write_multiple_files command — batch create/append in one call.
  *
  * Collapses N MCP round-trips into 1 (the actual bottleneck for scaffolding;
- * disk I/O is ~80ms even for 7MB). Different files run concurrently
- * (Promise.all); same-path entries are auto-serialized by writeFile's
- * per-path mutex. Per-file outcomes are reported independently — a failure
- * in one file never aborts the others (there's no cross-file FS transaction).
+ * disk I/O is ~80ms even for 7MB). Different files run concurrently; entries
+ * targeting the SAME file are applied sequentially in submission order, so a
+ * rewrite-then-append batch composes as written. Per-file outcomes are
+ * reported independently — a failure in one file never aborts the others
+ * (there's no cross-file FS transaction).
  */
 export async function handleWriteMultipleFiles(args: unknown): Promise<ServerResult> {
     try {
@@ -461,13 +473,47 @@ export async function handleWriteMultipleFiles(args: unknown): Promise<ServerRes
         const MAX_LINES = config.fileWriteLineLimit ?? 50;
         const protectionEnabled = config.writeFileOverwriteProtection !== false;
 
-        const outcomes = await Promise.all(
-            parsed.files.map(f => writeOneFile(
-                { path: f.path, content: f.content, mode: f.mode, allowOverwrite: f.allowOverwrite },
-                protectionEnabled,
-                MAX_LINES
-            ))
+        // Group by target path. Entries for the SAME path must run strictly in
+        // submission order: writeFile() awaits validatePath() *before* taking
+        // the per-path lock, so dispatching them all through Promise.all lets
+        // them reach the lock in arbitrary order. A 'rewrite' that loses that
+        // race lands after earlier appends and truncates them — the batch still
+        // reports every entry as succeeded (report A-003).
+        // Different paths stay fully concurrent.
+        const groups = new Map<string, typeof parsed.files>();
+        for (const f of parsed.files) {
+            const key = groupKeyForPath(f.path);
+            const bucket = groups.get(key);
+            if (bucket) {
+                bucket.push(f);
+            } else {
+                groups.set(key, [f]);
+            }
+        }
+
+        const grouped = await Promise.all(
+            [...groups.values()].map(async (entries) => {
+                const results: WriteOutcome[] = [];
+                for (const f of entries) {
+                    results.push(await writeOneFile(
+                        { path: f.path, content: f.content, mode: f.mode, allowOverwrite: f.allowOverwrite },
+                        protectionEnabled,
+                        MAX_LINES
+                    ));
+                }
+                return results;
+            })
         );
+
+        // Restore the caller's original entry order in the report.
+        const perGroupCursor = new Map<string, number>();
+        const groupOrder = [...groups.keys()];
+        const outcomes = parsed.files.map(f => {
+            const key = groupKeyForPath(f.path);
+            const idx = perGroupCursor.get(key) ?? 0;
+            perGroupCursor.set(key, idx + 1);
+            return grouped[groupOrder.indexOf(key)][idx];
+        });
 
         const okCount = outcomes.filter(o => o.ok).length;
         const failCount = outcomes.length - okCount;

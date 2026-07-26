@@ -32,6 +32,33 @@ const FILE_SIZE_LIMITS = {
     LINE_COUNT_LIMIT: 10 * 1024 * 1024,      // 10MB for line counting
 } as const;
 
+/**
+ * Run a readline pass over a file and guarantee the underlying descriptor is
+ * released, even when the consumer breaks out of the loop early.
+ *
+ * `rl.close()` only tears down the readline interface — it does NOT close the
+ * input stream. A stream that reached EOF closes itself, which is why full
+ * reads never leaked; but every early `break` (line-limit reached, sample size
+ * reached) left the fd open until GC. On Windows that fd keeps the file locked,
+ * so later deletes and atomic `rename` replacements fail with EPERM/EBUSY.
+ *
+ * Upstream issues: #476 (locked large files), #502 (locked `.tmp*` files).
+ */
+async function withLineReader<T>(
+    filePath: string,
+    streamOptions: { start?: number; signal?: AbortSignal },
+    consume: (lines: AsyncIterable<string>) => Promise<T>
+): Promise<T> {
+    const stream = createReadStream(filePath, streamOptions);
+    const rl = createInterface({ input: stream, crlfDelay: Infinity });
+    try {
+        return await consume(rl);
+    } finally {
+        rl.close();
+        stream.destroy();
+    }
+}
+
 const READ_PERFORMANCE_THRESHOLDS = {
     SMALL_READ_THRESHOLD: 100,    // For very small reads
     DEEP_OFFSET_THRESHOLD: 1000,  // For byte estimation
@@ -307,22 +334,17 @@ export class TextFileHandler implements FileHandler {
         fileTotalLines?: number,
         signal?: AbortSignal
     ): Promise<FileResult> {
-        const rl = createInterface({
-            input: createReadStream(filePath, { signal }),
-            crlfDelay: Infinity
-        });
-
         const buffer: string[] = new Array(requestedLines);
         let bufferIndex = 0;
         let totalLines = 0;
 
-        for await (const line of rl) {
-            buffer[bufferIndex] = line;
-            bufferIndex = (bufferIndex + 1) % requestedLines;
-            totalLines++;
-        }
-
-        rl.close();
+        await withLineReader(filePath, { signal }, async (lines) => {
+            for await (const line of lines) {
+                buffer[bufferIndex] = line;
+                bufferIndex = (bufferIndex + 1) % requestedLines;
+                totalLines++;
+            }
+        });
 
         let result: string[];
         if (totalLines >= requestedLines) {
@@ -353,23 +375,18 @@ export class TextFileHandler implements FileHandler {
         fileTotalLines?: number,
         signal?: AbortSignal
     ): Promise<FileResult> {
-        const rl = createInterface({
-            input: createReadStream(filePath, { signal }),
-            crlfDelay: Infinity
-        });
-
         const result: string[] = [];
         let lineNumber = 0;
 
-        for await (const line of rl) {
-            if (lineNumber >= offset && result.length < length) {
-                result.push(line);
+        await withLineReader(filePath, { signal }, async (lines) => {
+            for await (const line of lines) {
+                if (lineNumber >= offset && result.length < length) {
+                    result.push(line);
+                }
+                if (result.length >= length) break;
+                lineNumber++;
             }
-            if (result.length >= length) break;
-            lineNumber++;
-        }
-
-        rl.close();
+        });
 
         if (includeStatusMessage) {
             const statusMessage = this.generateEnhancedStatusMessage(result.length, offset, fileTotalLines, false);
@@ -394,21 +411,16 @@ export class TextFileHandler implements FileHandler {
         signal?: AbortSignal
     ): Promise<FileResult> {
         // First, do a quick scan to estimate lines per byte
-        const rl = createInterface({
-            input: createReadStream(filePath, { signal }),
-            crlfDelay: Infinity
-        });
-
         let sampleLines = 0;
         let bytesRead = 0;
 
-        for await (const line of rl) {
-            bytesRead += Buffer.byteLength(line, 'utf-8') + 1;
-            sampleLines++;
-            if (bytesRead >= READ_PERFORMANCE_THRESHOLDS.SAMPLE_SIZE) break;
-        }
-
-        rl.close();
+        await withLineReader(filePath, { signal }, async (lines) => {
+            for await (const line of lines) {
+                bytesRead += Buffer.byteLength(line, 'utf-8') + 1;
+                sampleLines++;
+                if (bytesRead >= READ_PERFORMANCE_THRESHOLDS.SAMPLE_SIZE) break;
+            }
+        });
 
         if (sampleLines === 0) {
             return await this.readFromStartWithReadline(filePath, offset, length, mimeType, includeStatusMessage, fileTotalLines, signal);
@@ -423,29 +435,23 @@ export class TextFileHandler implements FileHandler {
             const stats = await fd.stat();
             const startPosition = Math.min(estimatedBytePosition, stats.size);
 
-            const stream = createReadStream(filePath, { start: startPosition, signal });
-            const rl2 = createInterface({
-                input: stream,
-                crlfDelay: Infinity
-            });
-
             const result: string[] = [];
             let firstLineSkipped = false;
 
-            for await (const line of rl2) {
-                if (!firstLineSkipped && startPosition > 0) {
-                    firstLineSkipped = true;
-                    continue;
-                }
+            await withLineReader(filePath, { start: startPosition, signal }, async (lines) => {
+                for await (const line of lines) {
+                    if (!firstLineSkipped && startPosition > 0) {
+                        firstLineSkipped = true;
+                        continue;
+                    }
 
-                if (result.length < length) {
-                    result.push(line);
-                } else {
-                    break;
+                    if (result.length < length) {
+                        result.push(line);
+                    } else {
+                        break;
+                    }
                 }
-            }
-
-            rl2.close();
+            });
 
             const content = includeStatusMessage
                 ? `${this.generateEnhancedStatusMessage(result.length, offset, fileTotalLines, false)}\n\n${result.join('\n')}`
