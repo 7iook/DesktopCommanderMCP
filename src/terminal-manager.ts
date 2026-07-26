@@ -111,6 +111,31 @@ const POWERSHELL_UTF8_PREFIX =
   '[Console]::InputEncoding=[System.Text.Encoding]::UTF8;' +
   "$ProgressPreference='SilentlyContinue';";
 
+/**
+ * Re-export the child's real exit status as PowerShell's own.
+ *
+ * PowerShell reports its *script's* success, not the exit code of the program
+ * it ran: `node -e "process.exit(7)"` surfaces as 1. Every distinct failure
+ * (127 command-not-found, 2 usage error, 130 SIGINT) collapses into the same
+ * uninformative 1, so a caller — human or agent — has to guess why a command
+ * failed and often just retries blindly.
+ *
+ * `$?` must be captured first: reading it is itself a statement, so consulting
+ * $LASTEXITCODE beforehand would clobber it. The two are checked in order
+ * because they cover different failures — a native program sets
+ * $LASTEXITCODE, while a PowerShell-level failure (unknown command, failed
+ * cmdlet) leaves it unset and only flips $?. Testing $LASTEXITCODE alone
+ * would report success for a command that never ran.
+ *
+ * Interactive sessions (python -i, node REPL) never reach this tail: those
+ * commands don't return until the session is terminated.
+ */
+const POWERSHELL_EXIT_CODE_SUFFIX =
+  ';$__dcOk=$?;' +
+  'if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }' +
+  'elseif (-not $__dcOk) { exit 1 }' +
+  'else { exit 0 }';
+
 // NOTE on cmd.exe and CJK: cmd parses its command line using the OEM code
 // page (936/950/...) at spawn time — `chcp 65001` only affects subsequent
 // OUTPUT, not the parsing of the literal arguments cmd already received.
@@ -191,7 +216,8 @@ function getShellSpawnArgs(shellPath: string, command: string, patchEncoding: bo
   // quotes get mangled before the script body runs (upstream #350, bug.md).
   // -Login still applies — it controls profile loading, not the command source.
   if (shellName === 'pwsh' || shellName === 'pwsh.exe') {
-    const wrappedCommand = patchEncoding ? POWERSHELL_UTF8_PREFIX + command : command;
+    const wrappedCommand =
+      (patchEncoding ? POWERSHELL_UTF8_PREFIX + command : command) + POWERSHELL_EXIT_CODE_SUFFIX;
     const args = ['-Login', '-NoLogo', '-NonInteractive'];
     if (patchEncoding) args.push('-OutputFormat', 'Text');  // suppress CLIXML
     args.push('-EncodedCommand', encodePowerShellCommand(wrappedCommand));
@@ -205,7 +231,8 @@ function getShellSpawnArgs(shellPath: string, command: string, patchEncoding: bo
 
   // Windows PowerShell 5.1 (no -Login support)
   if (shellName === 'powershell' || shellName === 'powershell.exe') {
-    const wrappedCommand = patchEncoding ? POWERSHELL_UTF8_PREFIX + command : command;
+    const wrappedCommand =
+      (patchEncoding ? POWERSHELL_UTF8_PREFIX + command : command) + POWERSHELL_EXIT_CODE_SUFFIX;
     const args = ['-NoLogo', '-NonInteractive'];
     if (patchEncoding) args.push('-OutputFormat', 'Text');  // suppress CLIXML
     args.push('-EncodedCommand', encodePowerShellCommand(wrappedCommand));
