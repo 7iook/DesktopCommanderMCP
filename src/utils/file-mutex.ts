@@ -30,7 +30,16 @@ import path from 'path';
 
 const chains = new Map<string, Promise<unknown>>();
 
-function normalizeKey(absolutePath: string): string {
+/**
+ * Canonical key for "these two path strings mean the same file".
+ *
+ * Exported because batch tools must bucket their entries with EXACTLY this
+ * normalization: any grouping that disagrees with the lock's view splits one
+ * file into several independent read-modify-write passes and re-introduces the
+ * lost-update race the lock exists to prevent (see write_multiple_files /
+ * edit_block_multiple grouping).
+ */
+export function normalizePathKey(absolutePath: string): string {
     const resolved = path.resolve(absolutePath);
     // Windows file system is case-insensitive (NTFS by default); Unix is sensitive.
     return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
@@ -43,7 +52,7 @@ function normalizeKey(absolutePath: string): string {
  * Returns whatever `fn` returns. Throws whatever `fn` throws.
  */
 export async function withFileLock<T>(absolutePath: string, fn: () => Promise<T>): Promise<T> {
-    const key = normalizeKey(absolutePath);
+    const key = normalizePathKey(absolutePath);
     const prev = chains.get(key) ?? Promise.resolve();
     let release!: () => void;
     const next = new Promise<void>(r => { release = r; });

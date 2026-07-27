@@ -19,6 +19,7 @@ import { withTimeout } from '../utils/withTimeout.js';
 import { createErrorResponse } from '../error-handlers.js';
 import { configManager } from '../config-manager.js';
 import { applyReadFileCharCap } from '../utils/response-cap.js';
+import { normalizePathKey } from '../utils/file-mutex.js';
 
 import {
     ReadFileArgsSchema,
@@ -333,14 +334,15 @@ interface WriteOutcome {
 }
 
 /**
- * Group key for batch writes. Must match the normalization used by the
- * per-path write mutex (src/utils/file-mutex.ts) so that two spellings of the
- * same file — `C:/foo` and `c:\foo` — are serialized together rather than
- * racing each other.
+ * Group key for batch file operations (batch write here, batch edit in
+ * src/tools/edit.ts). Delegates to the per-path write mutex's own
+ * normalization (src/utils/file-mutex.ts) — SSOT — so that two spellings of
+ * the same file (`C:/foo` vs `c:\foo`, relative vs absolute) land in one
+ * bucket and are serialized rather than racing each other. Expands `~` first,
+ * which normalizePathKey alone does not do.
  */
-function groupKeyForPath(filePath: string): string {
-    const resolved = resolveAbsolutePath(filePath);
-    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+export function groupKeyForPath(filePath: string): string {
+    return normalizePathKey(resolveAbsolutePath(filePath));
 }
 
 async function writeOneFile(entry: WriteEntry, protectionEnabled: boolean, maxLines: number): Promise<WriteOutcome> {

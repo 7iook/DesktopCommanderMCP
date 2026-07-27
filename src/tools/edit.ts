@@ -29,7 +29,7 @@ import { detectLineEnding, normalizeLineEndings, type LineEndingStyle } from '..
 import { configManager } from '../config-manager.js';
 import { fuzzySearchLogger, type FuzzySearchLogEntry } from '../utils/fuzzySearchLogger.js';
 import { resolvePreviewFileType } from '../ui/file-preview/shared/preview-file-types.js';
-import { resolveAbsolutePath } from '../handlers/filesystem-handlers.js';
+import { resolveAbsolutePath, groupKeyForPath } from '../handlers/filesystem-handlers.js';
 
 interface SearchReplace {
     search: string;
@@ -632,12 +632,24 @@ interface PerEditResult {
 export async function editBlockMultiple(edits: MultiEditInput[]): Promise<ServerResult> {
     capture('server_edit_block_multiple', { editCount: edits.length });
 
-    // Group by file path, preserving per-file edit order.
+    // Group by file, keyed on the SAME normalization the per-path write mutex
+    // uses (file-mutex.ts: path.resolve + lowercase on win32). Keying on the
+    // raw file_path string instead splits one file into several groups whenever
+    // the caller mixes spellings — `dir\a.txt` vs `dir/a.txt`, relative vs
+    // absolute, differing drive-letter case. Each group then runs its own
+    // read-modify-write, so per-file atomicity silently breaks: one group
+    // writes while another reports the same file "left UNCHANGED". Same
+    // fingerprint as report A-003 on write_multiple_files, whose fix
+    // (groupKeyForPath) never propagated here. Per-file edit order preserved.
     const groups = new Map<string, MultiEditInput[]>();
     for (const e of edits) {
-        const key = e.file_path;
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key)!.push(e);
+        const key = groupKeyForPath(e.file_path);
+        const bucket = groups.get(key);
+        if (bucket) {
+            bucket.push(e);
+        } else {
+            groups.set(key, [e]);
+        }
     }
 
     interface FileOutcome {
@@ -745,8 +757,12 @@ export async function editBlockMultiple(edits: MultiEditInput[]): Promise<Server
         });
     };
 
+    // Drive each group with the FIRST entry's original path spelling, not the
+    // normalized group key: the key is lowercased on win32 (fine for bucketing,
+    // wrong to echo back or hand to validatePath) whereas the report should
+    // show the caller what they actually sent.
     const outcomes = await Promise.all(
-        Array.from(groups.entries()).map(([fp, fe]) => runFile(fp, fe))
+        Array.from(groups.values()).map(fe => runFile(fe[0].file_path, fe))
     );
 
     const filesOk = outcomes.filter(o => o.ok).length;

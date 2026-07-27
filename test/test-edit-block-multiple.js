@@ -88,6 +88,31 @@ async function main() {
       { file_path: fA, old_string: 'function doThing(){', new_string: 'x' }, // missing space
     ]);
     assert(textOf(res).includes('closest') && /\d+%/.test(textOf(res)), 'miss includes fuzzy closest-match hint');
+
+    // --- Test 8: same file under two path spellings must share ONE group ---
+    // Regression for A-004: grouping keyed on the raw file_path string put
+    // `dir\a.txt` and `dir/a.txt` in separate groups, so one group wrote while
+    // the other reported "file left UNCHANGED" for the same file — the report
+    // contradicted itself and per-file atomicity was silently broken.
+    await write(fA, 'one\ntwo\nthree\n');
+    const spellSep = fA;                        // native separators
+    const spellFwd = fA.replace(/\\/g, '/');    // forward slashes
+    res = await editBlockMultiple([
+      { file_path: spellSep, old_string: 'one', new_string: 'ONE' },
+      { file_path: spellFwd, old_string: 'two', new_string: 'TWO' },
+      { file_path: spellFwd, old_string: 'MISSING-XYZ', new_string: 'nope' },
+    ]);
+    assert(res.structuredContent?.totalFiles === 1, 'two spellings of one file collapse into a single group');
+    assert((await read(fA)) === 'one\ntwo\nthree\n', 'atomicity holds: nothing written when one edit misses');
+    assert(!textOf(res).includes('✅'), 'no group reported success for a file left unchanged');
+
+    // Same spellings, all edits valid → applied in submission order.
+    res = await editBlockMultiple([
+      { file_path: spellSep, old_string: 'one', new_string: 'ONE' },
+      { file_path: spellFwd, old_string: 'two', new_string: 'TWO' },
+    ]);
+    assert((await read(fA)) === 'ONE\nTWO\nthree\n', 'both spellings applied sequentially to one file');
+    assert(res.structuredContent?.editsApplied === 2, 'both edits counted as applied');
   } catch (err) {
     console.log(`${c.red}Unexpected: ${err.stack || err}${c.reset}`);
     failures++;
