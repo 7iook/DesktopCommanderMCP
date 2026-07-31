@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import { spawn, execFile } from 'child_process';
 import path from 'path';
 import { TerminalSession, CommandExecutionResult, ActiveSession, TimingInfo, OutputEvent } from './types.js';
 import { DEFAULT_COMMAND_TIMEOUT } from './config.js';
@@ -1043,6 +1043,66 @@ export class TerminalManager {
     return this.sessions.get(pid);
   }
 
+  /**
+   * Kill the whole descendant tree of a session's shell process.
+   *
+   * `ChildProcess.kill()` only signals the process we spawned — which is the
+   * shell wrapper (`powershell -EncodedCommand ...`, `cmd /c ...`, `bash -c
+   * ...`), not the command the caller actually ran. The real work (`uv run
+   * pytest`, `pnpm dev`, `tail -f`) is a grandchild, so killing the wrapper
+   * leaves it running, reparented and unreachable: on Windows nothing reaps
+   * orphans, so it survives until reboot.
+   *
+   * Windows has no signal semantics at all — `kill()` there is a hard
+   * TerminateProcess on that single pid — so `taskkill /T` is the only way to
+   * reach descendants, and it must carry `/F`: without it Windows merely posts
+   * a close request that a non-GUI process like PowerShell ignores (verified:
+   * `/T` alone left both wrapper and child alive, `/T /F` killed both).
+   *
+   * Ordering matters and is counter-intuitive. `/T` resolves the tree at call
+   * time, so it must run while the wrapper is still alive; killing the wrapper
+   * first (the "SIGINT then SIGKILL" shape that reads as gentler) destroys it
+   * immediately on Windows, orphaning the descendants before any sweep can
+   * find them. That is exactly the bug this method exists to fix, so on Windows
+   * we take the tree down in one shot and never pre-kill the wrapper.
+   *
+   * On POSIX we walk the tree with `pgrep -P` instead of killing a process
+   * group, because these shells are spawned without `detached: true` and
+   * therefore share the server's group; signalling the group would hit the MCP
+   * server itself.
+   *
+   * Best-effort by design: the sweep is fire-and-forget, and a pid that already
+   * exited (ESRCH / "not found") is a success, not an error.
+   */
+  private killProcessTree(pid: number, force: boolean): void {
+    if (process.platform === 'win32') {
+      // Always /F — see above, /T without /F is a no-op for console processes.
+      // Scoped to this pid's subtree — never `/IM`, which would match every
+      // process sharing the image name and take out unrelated MCP servers.
+      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], () => {});
+      return;
+    }
+
+    const signal = force ? 'SIGKILL' : 'SIGINT';
+    // -P is children-of-pid, so recurse to reach deeper descendants. Kill
+    // depth-first (children before the parent) so a supervisor like `uv` does
+    // not observe its child dying and restart it. The caller signals `pid`
+    // itself, so this only ever touches descendants.
+    execFile('pgrep', ['-P', String(pid)], (err, stdout) => {
+      if (err || !stdout) return;
+      for (const line of stdout.split('\n')) {
+        const childPid = Number.parseInt(line.trim(), 10);
+        if (!Number.isInteger(childPid) || childPid <= 0) continue;
+        this.killProcessTree(childPid, force);
+        try {
+          process.kill(childPid, signal);
+        } catch {
+          // Already gone (ESRCH) or not ours (EPERM) — nothing to do.
+        }
+      }
+    });
+  }
+
   forceTerminate(pid: number): boolean {
     const session = this.sessions.get(pid);
     if (!session) {
@@ -1050,12 +1110,27 @@ export class TerminalManager {
     }
 
     try {
+        if (process.platform === 'win32') {
+          // One shot, tree intact. Pre-killing the wrapper here would orphan
+          // the descendants before /T could resolve them (see killProcessTree).
+          // There is no gentler step to offer: Windows kill() is already a hard
+          // terminate, so a two-phase escalation buys nothing and costs the tree.
+          this.killProcessTree(pid, true);
+          return true;
+        }
+
+        // POSIX: SIGINT is a real signal a shell can pass on, so keep the
+        // grace period. Descendants first, then the shell we own — reversed,
+        // a wrapper that restarts its child (uv, poetry, npm) could spawn a
+        // fresh one in the window between the two calls.
+        this.killProcessTree(pid, false);
         session.process.kill('SIGINT');
         setTimeout(() => {
           if (this.sessions.has(pid)) {
+            this.killProcessTree(pid, true);
             session.process.kill('SIGKILL');
           }
-        }, 1000);
+        }, 1000).unref?.();
         return true;
       } catch (error) {
         // Convert error to string, handling both Error objects and other types
