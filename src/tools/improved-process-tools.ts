@@ -630,6 +630,26 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
 
   const responseText = output || '(No output in requested range)';
 
+  // A failed command with zero captured output is the single most misleading
+  // result this tool can return: "(No output in requested range)" reads like a
+  // paging mistake, so the caller re-reads with different offsets, then starts
+  // re-running the command with its output teed to a file to find out what
+  // actually happened. Name the situation instead, and point at the causes that
+  // actually produce it — output written straight to a console handle (see the
+  // AllocConsole class of failures), a GUI/detached child, or output that only
+  // exists on a stream this shell didn't pipe back.
+  let emptyOutputHint = '';
+  if (result.isComplete && result.totalLines === 0 && result.exitCode !== 0) {
+    emptyOutputHint =
+      `\n\n⚠️ This process FAILED (exit code ${result.exitCode}) and produced NO capturable output.\n` +
+      `This is not a paging problem — re-reading with a different offset will not help.\n` +
+      `Likely causes, in order: the program wrote to a console handle instead of the\n` +
+      `redirected pipe (common for nested shells / GUI-spawning tools), or it only wrote\n` +
+      `to a stream this shell did not pipe back.\n` +
+      `Next steps: re-run with \`2>&1\` to merge stderr into stdout, add the tool's own\n` +
+      `verbose/log flag, or redirect to a file and read that file.`;
+  }
+
   // Char-level cap so a long-line process (every line > 1KB) can't blow up
   // the host context. Line-level pagination above bounds line count, but
   // doesn't bound chars-per-line; this is the second guard.
@@ -643,7 +663,7 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
   return {
     content: [{
       type: "text",
-      text: `${statusMessage}\n\n${cappedResponse}${processStateMessage}${timingMessage}`
+      text: `${statusMessage}\n\n${cappedResponse}${processStateMessage}${emptyOutputHint}${timingMessage}`
     }],
   };
 }

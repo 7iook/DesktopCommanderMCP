@@ -26,6 +26,13 @@ export const ListProcessesArgsSchema = z.object({});
 // Terminal tools schemas
 export const StartProcessArgsSchema = z.object({
   command: z.string(),
+  // How long start_process waits for initial output before returning the PID
+  // and letting the process keep running in the background. NOTE: the MCP
+  // transport enforces its own ~60s ceiling on a single tool call, so a value
+  // above that does not extend anything — the call is cut off first while the
+  // process itself keeps running. For longer work, pass a smaller timeout here
+  // and poll with read_process_output (offset=-50, follow_ms=3000), or have the
+  // command write to a file and read that file.
   timeout_ms: z.number(),
   shell: z.string().optional(),
   verbose_timing: z.boolean().optional(),
