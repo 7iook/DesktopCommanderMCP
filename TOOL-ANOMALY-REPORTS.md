@@ -86,3 +86,64 @@
 - **修复**: 新增 `withLineReader()` helper 统一收口，`finally { rl.close(); stream.destroy(); }`，四处 readline 调用点（含本身无 break 的 `readFromEndWithReadline`）全部迁移，`signal` 透传保留。收口后该文件内 `createReadStream`/`createInterface` 仅剩 helper 内部一处，杜绝第二种写法复发。
 - **回归测试**: `test/test-read-file-handle-release.js`。修复前红，且失败签名 `EPERM: rename ....tmp -> ...` 与 #476 报告的 `PermissionError: [WinError 5]` 完全同一形态；修复后 3/3 绿。
 - **状态**: fixed（本地分支；上游 #476 / #502 仍 open，可据此提 PR）
+
+
+### A-005: mcphub 宿主环境变量泄漏进 desktop-commander 子 shell,污染构建/服务(NODE_ENV / PORT 母题,两次实证)
+- **日期**: 2026-07-27
+- **现象**: ① `pnpm build`(Next 16.1.6)在 prerender `/_global-error` 时报 `TypeError: Cannot read properties of null (reading 'useContext')`,连纯上游干净代码也失败,极易误判为代码/框架回归;② 早前 `next dev` 抢绑 3799 撞 mcphub 自身端口(EADDRINUSE)。
+- **根因**: desktop-commander 的子 shell 继承 mcphub 进程环境,其中带着 `NODE_ENV=development` 与 `PORT=3799`。Next 16 在 non-standard NODE_ENV 下触发已知 prerender bug(vercel/next.js#86146 明确记载该变体);PORT 则被 next dev 直接采用。受控对照:仅 `Remove-Item Env:NODE_ENV` 后同一 build 立即 EXIT=0。
+- **处置**: 构建/启动前端命令前显式清理:`Remove-Item Env:NODE_ENV`、`$env:PORT='<期望端口>'`。
+- **修复方向**: mcphub 启动 stdio server 时不向子进程透传自身的 NODE_ENV/PORT(或 desktop-commander spawn shell 时白名单化环境);至少在 README 声明该行为。
+
+
+### A-006: edit_block_multiple 同文件两种路径写法被拆成两组,破坏「按文件原子」且报告自相矛盾
+- **日期 / 报告者**: 2026-07-27 / JXai
+- **工具**: edit_block_multiple（本分支新增，上游 main 无此工具）
+- **环境**: Windows 11 + mcphub desktop-commander MCP
+- **现象**: 一次调用内同一文件混用 `dir\a.txt` 与 `dir/a.txt`，报告同时出现 `✅ ...a.txt (1 edit applied)` 与 `❌ ...a.txt — file left UNCHANGED (per-file atomic — NOTHING saved)`，`totalFiles=2`；磁盘实际为第一组已落盘的中间态。AI 读到这份报告无法得出正确结论，且工具承诺的「按文件原子」实际失效。
+- **复现**: `editBlockMultiple([{path: 'X\\a.txt', ...ok}, {path: 'X/a.txt', ...ok}, {path: 'X/a.txt', ...miss}])`；观察 `structuredContent.totalFiles` 与磁盘内容。
+- **根因**: `editBlockMultiple` 的分组 key 用**原始 `args.file_path` 字符串**，两种拼写落入不同 bucket → 各自独立 read-modify-write，per-file 原子性与 per-path 锁的「同一文件」视图脱节。**这是 A-003 的同源指纹**：`write_multiple_files` 早已改用归一化 `groupKeyForPath()` 修掉同一问题，修复未传播到 edit 路径（E-060 改 A 漏传播母题）。触发场景很现实：路径来自不同来源（搜索结果给正斜杠、`list_directory` 给反斜杠）或盘符大小写不一致。
+- **自动检测覆盖?** 无；调用返回 `isError` 为 false（有组成功即不算错），`get_recent_anomalies` 无对应规则。
+- **修复**: 归一化收口为 SSOT —— `file-mutex.ts` 导出 `normalizePathKey()`（原私有 `normalizeKey`），`groupKeyForPath()` 改为委托它并导出，`editBlockMultiple` 与 `handleWriteMultipleFiles` 共用同一 key 函数，杜绝二次分叉。每组用组内首条 edit 的原始拼写驱动 `runFile`（归一化 key 在 win32 被小写，不能回显也不能喂 `validatePath`）。
+- **回归测试**: `test/test-edit-block-multiple.js` Test 8（修复前红 4 条：`totalFiles=2`、中间态落盘、报告出现 `✅`、`editsApplied` 计数错）。相邻回归 `test-write-multiple-same-path.js` / `test-edit-block-line-endings.js` / `test-edit-block-occurrences.js` / `test-markdown-editor-edit-diff.js` 全绿。
+- **状态**: fixed（2026-07-27）
+
+
+### A-007: PowerShell 错误流被 CLIXML 过滤器整块删除 —— 失败命令返回「零输出」
+- **日期 / 报告者**: 2026-08-04 / JXai
+- **工具**: start_process / read_process_output(Windows + `powershell.exe`)
+- **环境**: Windows 11 + pwsh/powershell 5.1 + node22 + mcphub desktop-commander MCP
+- **现象**: 命令失败但捕获输出**完全为空**:`read_process_output` 返回 `[Reading 0 new lines (total: 0 lines)]` + `(No output in requested range)`。AI 无法得知失败原因,典型反应是把命令改成 `2>&1 | Tee-Object <file>` 再 `Get-Content` 绕回来 —— 绕的这一大圈本质是在人工修补工具层删掉的东西。
+- **复现**(任一即可,均 0 行输出):`this-command-does-not-exist-xyz` / `Get-Item 'E:\no\such\file.txt'` / `Write-Error 'x'` / `throw 'x'` / 原生 stderr 经 `2>&1 | Out-String` 转进 PS 错误流。
+- **不受影响**(对照,证明作用域):原生 stderr **未**重定向(`git checkout no-such-branch` 活着)、stdout 全程正常、pwsh 7 完全不受影响(实测其 stderr 为 271 字节纯文本,根本不发 CLIXML)。
+- **根因**: `stripPsCliXml` / `filterCliXmlStreamImpl` 用 `/<Objs [\s\S]*?<\/Objs>/g → ''` 删**整个信封**。但字节级取证显示 PS 5.1 把两类东西装进**同一个** `<Objs>`:`<Obj S="progress">`(模块加载噪音,该删)与 `<S S="Error">`(真正的报错文本,被连坐删除)。即「删噪音」的实现顺手删掉了唯一的诊断信息。取证:绕过过滤器直抓 spawn stderr = 1371 字节且 `hasErrorRec=true`,经过滤器后缓冲区 0 行。
+- **自动检测覆盖?** 无。调用 `isError=false`,`get_recent_anomalies` 无对应规则 —— 这正是它最危险的地方:三个信号(空输出 + 退出码 + 无错误标记)一致地指向「成功」。
+- **上游对应**: issue **#395**(2026-03-25,open)现象逐字吻合(`0 lines` + `exit code 1`),报告者称「200 次调用 11 次失败里 6 次是这个形态,是 DC 最常见的失败模式」,但把原因归给「进程 <100ms 退出的竞态」。**该归因很可能是错的**:缓冲区在 data 回调里同步写入、退出时整体复制进 completedSessions,不需要竞态就能解释 0 行;真凶是上面的删除逻辑。
+- **修复**: 新增 `src/utils/clixml.ts`,`extractClixmlRecords()` 只保留 `<S S="Error|Warning|Information|Verbose|Debug">` 的记录文本(还原 `_xNNNN_` 转义与 XML 实体),仅丢 `<Obj S="progress">`;两处调用点(`stripPsCliXml` 与流式 `filterCliXmlStreamImpl`)**同时**改为委托它,跨 chunk carry 机制不变。
+- **回归测试**: `test/test-clixml-error-recovery.js`(24 断言)、`test/test-ps-error-visibility-e2e.js`(端到端 12 例)。**红检**在 `test-ps-cjk-and-redcheck.js` 里固化:同一真实信封喂旧正则得空串、喂新实现得回原文,防止测试空转。修复后四类失败命令捕获字符数 458/415/577/353(修复前均为 0)。
+- **状态**: fixed(2026-08-04,本地分支;上游 #395 仍 open,可据此提 PR 并纠正其根因判断)
+
+
+### A-008: `$LASTEXITCODE` 粘性导致失败命令上报 exit 0(与 A-007 叠加 = 空输出 + 退出码 0 + 实际失败)
+- **日期 / 报告者**: 2026-08-04 / JXai
+- **工具**: start_process(Windows + PowerShell)
+- **环境**: Windows 11 + powershell 5.1 + node22
+- **现象**: `node -e "process.exit(0)"; Get-Item 'E:\no\such\file.txt'` 上报 **exit code 0**,而后半句明确失败。与 A-007 叠加后 AI 收到的三个信号全部指向成功 —— 这是「AI 明明失败却继续往下走」最直接的成因。
+- **复现**: 任何「原生命令成功 → 后续 cmdlet 失败」的组合。判定证据:`AFTER-NATIVE: LASTEXITCODE=[0]`(原生命令留下 0),`TAIL: LASTEXITCODE=[] ok=[False]`(cmdlet 失败只翻 `$?`,**不写** LASTEXITCODE)。
+- **根因**: `POWERSHELL_EXIT_CODE_SUFFIX`(commit 3673c33 引入)判定顺序为「先 `$LASTEXITCODE` 后 `$?`」。但 `$LASTEXITCODE` 是**粘性**的:只有原生可执行文件写它,且事后无人清空;cmdlet 失败只翻 `$?`。于是失败的 cmdlet 读到前一条原生命令留下的陈旧 0 → 上报成功。注意 3673c33 本身修的是「原生退出码被压成 1」的真问题,不能回退,只能修正**顺序**。
+- **自动检测覆盖?** 无。
+- **修复**: 顺序反转为 `$?` 优先 —— `if (-not $__dcOk) { exit ($LASTEXITCODE ? $LASTEXITCODE : 1) } elseif ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 0 }`。`$?` 始终反映**最后一条语句**,故对失败具有权威性;`$LASTEXITCODE` 仅用于提供具体码值(7/127/2),保住 3673c33 的收益。
+- **回归测试**: `test/test-ps-error-visibility-e2e.js` 8 例退出码矩阵(含本条 sticky 用例),既有 `test/test-exit-code-propagation.js` 5 例全绿(未回退 3673c33)。
+- **状态**: fixed(2026-08-04)
+
+
+### A-009: PS CLIXML / cmd 报错为 OEM 码页字节,按 UTF-8 解码成乱码
+- **日期 / 报告者**: 2026-08-04 / JXai
+- **工具**: start_process(Windows + powershell / cmd)
+- **环境**: Windows 11(OEMCP=936)+ node22
+- **现象**: 中文报错显示为 `����ڲ����ⲿ����`。本会话内实证两处:cmd `'xxx' 不是内部或外部命令`;PS CLIXML 信封内的中文错误文本。
+- **根因**: `data.toString()` 隐式按 UTF-8 解码,但两者都发 OEM 码页(936/950/932)字节。PS 的 UTF-8 前缀管不到 CLIXML —— PS 在任何用户命令执行**之前**就初始化了 CLIXML writer;cmd 的注释早已说明其按 OEM 解析命令行、注入 `chcp` 只会更糟,但此前只是「放弃」,未在**读取侧**按码页解码。
+- **修复**: `ShellByteDecoder` 按字节嗅探 —— 严格 UTF-8 校验通过则按 UTF-8,否则按 OEM 码页(从注册表 `Nls\CodePage\OEMCP` 读取并缓存,**不用 `chcp`**:chcp 报的是本进程控制台的码页,宿主已设 65001 时会误判)。方向可靠因 UTF-8 自校验:GBK/Big5/SJIS 几乎不可能构成合法 UTF-8,而真 UTF-8 必然合法。
+- **陷阱(实施中实测踩到)**: 必须**先定编码再量尾巴**。`CE DE`(GBK「无」)里 0xDE 是完成字符的尾字节,在 UTF-8 里却是等待续字节的首字节;先量后猜会把完整 GBK 文本判成截断并从中间切开(该 bug 被 `split GBK reassembles` 断言抓到,当时得 3 字符而非 2)。修正后按「整体是合法 UTF-8?→ 去掉短尾后是否合法且尾部为合法 UTF-8 前缀?→ 否则按 DBCS 从头走 lead/trail 配对」三级判定。
+- **回归测试**: `test-clixml-error-recovery.js` 的解码组(GBK→中文、真 UTF-8 不被破坏、逐字节切分重组、DBCS 切分重组、`incompleteTailLength` 边界);`test-ps-cjk-and-redcheck.js` 端到端验证中文报错可读、中文 stdout 无回归、40 行跨 chunk CJK 无 U+FFFD。
+- **状态**: fixed(2026-08-04)。**遗留**:cmd.exe 的 CJK 仍受「命令行按 OEM 解析」限制(源码注释所述),本次只修读取侧解码;需要可靠 CJK 仍建议用 pwsh。
