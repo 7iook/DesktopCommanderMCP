@@ -505,6 +505,13 @@ function countOccurrences(haystack: string, needle: string): number {
 export class DocxFileHandler implements FileHandler {
     private readonly extensions = ['.docx'];
 
+    /**
+     * DOCX genuinely owns text replacement: editRange() runs find/replace over the
+     * pretty-printed XML (and headers/footers), which raw-byte search/replace cannot do.
+     * The edit_block dispatcher keeps routing old_string edits here because of this flag.
+     */
+    readonly ownsTextReplacement = true;
+
     canHandle(path: string): boolean {
         return this.extensions.some(e => path.toLowerCase().endsWith(e));
     }

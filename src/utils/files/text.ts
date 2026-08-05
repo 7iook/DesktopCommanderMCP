@@ -21,8 +21,18 @@ import {
     FileHandler,
     ReadOptions,
     FileResult,
-    FileInfo
+    FileInfo,
+    EditResult
 } from './base.js';
+import { detectLineEnding, normalizeLineEndings } from '../lineEndingHandler.js';
+import {
+    splitLines,
+    findHeadings,
+    matchHeadings,
+    resolveSection,
+    hashSectionBody,
+    normalizeHeading
+} from './markdownSection.js';
 
 // TODO: Centralize these constants with filesystem.ts to avoid silent drift
 // These duplicate concepts from filesystem.ts and should be moved to a shared
@@ -71,6 +81,25 @@ const READ_PERFORMANCE_THRESHOLDS = {
  * Binary detection is done at the factory level - this handler assumes file is text
  */
 export class TextFileHandler implements FileHandler {
+    /**
+     * This handler does NOT own old_string/new_string replacement — see the dispatcher in
+     * src/tools/edit.ts. Its editRange() serves markdown section addressing only.
+     *
+     * Why this flag exists: the dispatcher used to route text replacement to editRange()
+     * whenever a handler merely HAD that method. Adding editRange() here would therefore
+     * have silently rerouted every existing text edit away from performSearchReplace(),
+     * bypassing fuzzy matching, mixed-EOL diagnostics and the A-004 path-grouping fix.
+     * DOCX genuinely owns its text replacement (find/replace over pretty-printed XML) and
+     * sets this true; text does not.
+     */
+    readonly ownsTextReplacement = false;
+
+    /**
+     * A markdown section body is prose, not a JSON payload — the dispatcher must not
+     * JSON.parse() it (a section whose entire body is `123` has to stay literal text).
+     */
+    readonly rangeContentIsRawText = true;
+
     canHandle(_path: string): boolean {
         // Text handler accepts all files that pass the factory's binary check
         // The factory routes binary files to BinaryFileHandler before reaching here
@@ -462,4 +491,150 @@ export class TextFileHandler implements FileHandler {
             await fd.close();
         }
     }
+
+    /**
+     * Replace a markdown section's body, addressed by its heading line.
+     *
+     * WHY THIS IS SEPARATE FROM edit_block's TEXT PATH
+     * `old_string` replacement needs the caller to hold a byte-exact copy of the old text.
+     * For a whole-section rewrite that means quoting the entire section, where one full-width
+     * comma or trailing space fails the edit. Here only the heading line is matched and the
+     * end boundary is computed from the heading hierarchy, so the caller never quotes the
+     * body it is replacing.
+     *
+     * ⚠️ DELIBERATELY NOT WIRED INTO edit_block's old_string PATH.
+     * `edit.ts` dispatches text replacement to `performSearchReplace`, which owns fuzzy
+     * matching, mixed-EOL diagnostics and the A-004 path-grouping fix. This method must never
+     * become the route for `old_string` edits — `ownsTextReplacement` on this class stays
+     * false so the dispatcher keeps sending them to `performSearchReplace`.
+     *
+     * @param path      Validated absolute path
+     * @param range     Heading text (leading `#` optional); `''` is rejected
+     * @param content   New body WITHOUT the heading line
+     * @param options   `{ expected_section_hash }` — REQUIRED (see below)
+     */
+    async editRange(
+        path: string,
+        range: string,
+        content: any,
+        options?: Record<string, any>
+    ): Promise<EditResult> {
+        const fail = (error: string): EditResult => ({
+            success: false,
+            editsApplied: 0,
+            errors: [{ location: range || '(empty range)', error }],
+        });
+
+        if (typeof range !== 'string' || range.trim() === '') {
+            return fail('section mode requires a non-empty heading in `range`');
+        }
+        if (typeof content !== 'string') {
+            return fail('section mode requires `content` to be a string (the new section body)');
+        }
+
+        // The concurrency token is MANDATORY, not advisory. Section mode removes the implicit
+        // compare-before-write that `old_string` provided for free; making the hash optional
+        // would turn "stale writes fail loudly" into "stale writes clobber silently" — the
+        // exact regression review DC1 flagged. Callers must read the section first.
+        const expected = options?.expected_section_hash;
+        if (typeof expected !== 'string' || expected === '') {
+            return fail(
+                'missing_section_hash: section mode requires `expected_section_hash` ' +
+                '(sha256 of the current section body). Read the section first, then retry.'
+            );
+        }
+
+        const original = await fs.readFile(path, 'utf8');
+        const lineEnding = detectLineEnding(original);
+        const lines = splitLines(original);
+        const headings = findHeadings(lines);
+        const hits = matchHeadings(headings, range);
+
+        // A hallucinated or ambiguous heading must never fall through to a guess: replacing the
+        // wrong section destroys a whole block, so both misses fail loudly instead.
+        if (hits.length === 0) {
+            const suggestions = headings
+                .map(h => ({ h, score: similarityScore(normalizeHeading(range), h.normalized) }))
+                // 0.3, not 0.5: these are hints, not decisions — the edit already failed and
+                // nothing is applied automatically, so a slightly noisy list costs the caller
+                // one glance while a missing list costs another wrong round-trip.
+                .filter(s => s.score >= 0.3)
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 3)
+                .map(s => `  line ${s.h.lineIndex + 1}: ${s.h.raw.trim()} (${Math.round(s.score * 100)}%)`);
+
+            return fail(
+                `heading not found: "${range}"` +
+                (suggestions.length ? `\nclosest headings:\n${suggestions.join('\n')}` : '') +
+                '\nNote: suggestions are NOT applied automatically — re-issue with an exact heading.'
+            );
+        }
+        if (hits.length > 1) {
+            const where = hits.map(i => `line ${headings[i].lineIndex + 1}`).join(', ');
+            return fail(
+                `heading is not unique: "${range}" matches ${hits.length} headings (${where}). ` +
+                'Section mode cannot narrow by parent path; use old_string/new_string for this edit.'
+            );
+        }
+
+        const section = resolveSection(lines, headings, hits[0]);
+        const actual = hashSectionBody(lines, section);
+        if (actual !== expected) {
+            return fail(
+                `stale_section: the section body changed since it was read. ` +
+                `expected ${expected}, actual ${actual}. Re-read the section and retry.`
+            );
+        }
+
+        // Splice the body, keeping the heading line and everything outside the section
+        // byte-identical. Content is normalized to the file's existing line ending so a
+        // CRLF file does not silently gain LF lines.
+        const newBody = content === '' ? [] : splitLines(normalizeLineEndings(content, lineEnding));
+        const updated = [
+            ...lines.slice(0, section.bodyStart),
+            ...newBody,
+            ...lines.slice(section.bodyEnd),
+        ].join(lineEnding);
+
+        await fs.writeFile(path, updated, 'utf8');
+        return { success: true, editsApplied: 1 };
+    }
+}
+
+/**
+ * Cheap similarity for heading suggestions only (never for deciding a match).
+ *
+ * Deliberately not the worker-thread fuzzy search from tools/fuzzySearch.ts: that one is
+ * built for scanning whole-file content for a multi-line needle, whereas this compares two
+ * short single-line strings where a character-bigram ratio is adequate and synchronous.
+ *
+ * Containment scores 0.9 regardless of length ratio. A pure bigram ratio punishes short
+ * headings hard — measured in an end-to-end run, "Beta Section" vs "Beta" scored below the
+ * suggestion cut-off, so a caller who wrote a slightly-too-long heading got no hint at all
+ * and had to guess again. One substring being the other is exactly the typo class worth
+ * surfacing (extra or dropped trailing words), so it is scored on containment rather than
+ * on how much text the two share.
+ */
+function similarityScore(a: string, b: string): number {
+    if (a === b) return 1;
+    if (a.length < 2 || b.length < 2) return 0;
+    if (a.includes(b) || b.includes(a)) return 0.9;
+
+    const bigrams = new Map<string, number>();
+    for (let i = 0; i < a.length - 1; i++) {
+        const g = a.slice(i, i + 2);
+        bigrams.set(g, (bigrams.get(g) ?? 0) + 1);
+    }
+
+    let hits = 0;
+    for (let i = 0; i < b.length - 1; i++) {
+        const g = b.slice(i, i + 2);
+        const n = bigrams.get(g) ?? 0;
+        if (n > 0) {
+            bigrams.set(g, n - 1);
+            hits++;
+        }
+    }
+
+    return (2 * hits) / (a.length - 1 + b.length - 1);
 }

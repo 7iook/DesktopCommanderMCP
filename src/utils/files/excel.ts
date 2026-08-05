@@ -31,6 +31,12 @@ interface ExcelMetadata {
  * Supports: .xlsx, .xls, .xlsm files
  */
 export class ExcelFileHandler implements FileHandler {
+    /**
+     * Excel owns text replacement for its file type: a spreadsheet's cells cannot be edited
+     * by raw-byte search/replace, so old_string edits must reach editRange() here rather
+     * than performSearchReplace(). Preserves the pre-existing dispatch behaviour.
+     */
+    readonly ownsTextReplacement = true;
 
     canHandle(path: string): boolean {
         const ext = path.toLowerCase();

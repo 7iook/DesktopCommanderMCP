@@ -950,6 +950,54 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         - Change style: old_string='<w:pStyle w:val="Normal"/>' new_string='<w:pStyle w:val="Heading1"/>'
                         - Add content: include surrounding XML context in old_string, add new elements in new_string
 
+                        MARKDOWN / PLAIN TEXT - Section Rewrite mode:
+                        Replaces the BODY of one section, located by its heading line.
+                        Takes:
+                        - file_path: Path to the file to edit
+                        - range: The heading text, leading "#" optional - "## Migration Safety" or "Migration Safety"
+                        - content: The new section body, as a plain string, WITHOUT the heading line
+                        - options: { expected_section_hash: "sha256:..." } - REQUIRED, see below
+                        Supply NO old body text. Only the heading line is matched, and the section's end
+                        boundary is computed for you: a section runs from just after its heading to the next
+                        heading of the SAME OR HIGHER level (so "## Guide" swallows all of its "###"
+                        subsections), or to end of file for the last section. The heading line itself is never
+                        replaced. Headings inside fenced code blocks are ignored. Because no old body is
+                        quoted, punctuation, whitespace, line-ending and BOM differences in the existing body
+                        can no longer fail the edit. expected_replacements does not apply in this mode.
+
+                        expected_section_hash IS MANDATORY here: the sha256 of the section's CURRENT body
+                        (body lines joined with LF, heading line excluded), prefixed "sha256:". It is
+                        optimistic concurrency control - if the section changed since you read it, the edit
+                        fails loudly and writes ZERO bytes rather than clobbering the newer content. Omitting
+                        it fails with missing_section_hash. Obtain it by hashing the body you just read, or
+                        send one call with a placeholder hash: the resulting stale_section error names the
+                        actual hash, then retry with it.
+
+                        A heading matching 0 times or 2+ times NEVER falls through to a guess: 0 matches fails
+                        listing the closest similar headings, 2+ matches fails listing every matching line
+                        number. Heading matching is case-sensitive. Section mode cannot narrow duplicate
+                        headings by parent path - use old_string/new_string for that particular edit.
+
+                        WHEN NOT TO USE SECTION MODE - use old_string/new_string instead if ANY of these hold:
+                        1. The file is not markdown-style prose. This mode is NOT gated on the .md extension;
+                           it reaches any text file. In comment-based files (.py, .sh, .yml, Dockerfile) every
+                           "# comment" line is heading-shaped, so a section edit there can span from one
+                           comment to the next.
+                        2. The change touches only one or two lines inside the section.
+                        3. You are not certain where the section ends.
+                        Rationale: a wrong old_string edit usually fails to match at all, and at worst damages
+                        a few lines; a wrong section edit destroys the ENTIRE section. Prefer the mode whose
+                        failure is smaller.
+
+                        For N section rewrites use edit_block_multiple, which accepts range/content per edit
+                        and applies them in ONE call: all sections are resolved against a single read, then
+                        spliced back-to-front so an earlier rewrite cannot shift a later section's boundary.
+                        A heading and one of its own subheadings in the same call is rejected as
+                        overlapping_sections, writing zero bytes. Section and old_string edits may be mixed
+                        across edits in one call, and per-file atomicity still holds: if any edit for a file
+                        fails, that file is left untouched. In edit_block, content: "" is rejected by the
+                        schema - to blank a section, pass a single blank line instead.
+
                         By default, replaces only ONE occurrence of the search text.
                         To replace multiple occurrences, provide expected_replacements with
                         the exact number of matches expected.
@@ -958,8 +1006,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         amount of context necessary (typically 1-3 lines) before and after the change point,
                         with exact whitespace and indentation.
 
-                        When editing multiple sections, make separate edit_block calls for each distinct change
-                        rather than one large replacement.
+                        When editing multiple separate places, make separate edit_block calls for each distinct
+                        change rather than one large replacement.
 
                         When a close but non-exact match is found, a character-level diff is shown in the format:
                         common_prefix{-removed-}{+added+}common_suffix to help you identify what's different.
@@ -998,8 +1046,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         2. read_file around those lines to copy exact context for each old_string.
                         3. edit_block_multiple with all the edits at once.
 
-                        Input: { edits: [ { file_path, old_string, new_string, expected_replacements? (default 1) }, ... ] }
-                        Multiple edits may target the same file; they are applied in order to that file.
+                        Input: { edits: [ { file_path, ...mode }, ... ] } — each edit picks ONE mode:
+                          text:    { old_string, new_string, expected_replacements? (default 1) }
+                          section: { range, content, expected_section_hash }  (markdown section rewrite)
+                        Setting both modes on one edit is rejected. Modes may be mixed across edits.
+                        Multiple edits may target the same file; text edits apply in order to that file.
 
                         BEHAVIOR:
                         - PER-FILE ATOMIC: all edits for a file are applied in one read-modify-write;
@@ -1007,11 +1058,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                           and the failure is reported with a closest-match hint.
                         - Files are processed concurrently and independently; a failure in one file
                           never affects another.
-                        - Plain-text search/replace only (same matching as edit_block). For Excel or
-                          DOCX edits use edit_block per file; to CREATE files use write_multiple_files.
+                        - SECTION MODE (see edit_block for the full contract): sections are located by
+                          heading against a single read, then spliced back-to-front so an earlier rewrite
+                          cannot shift a later section's boundary. expected_section_hash is REQUIRED per
+                          section edit; a stale or missing hash, an unknown or duplicate heading, or a
+                          heading overlapping one of its own subheadings all fail before any byte is written.
+                        - For Excel or DOCX edits use edit_block per file; to CREATE files use
+                          write_multiple_files.
 
                         Each old_string must include enough surrounding context to match uniquely
-                        (1-3 lines), exactly like edit_block.
+                        (1-3 lines), exactly like edit_block. Section edits need no old body at all —
+                        only the heading line is matched.
 
                         ${PATH_GUIDANCE}
                         ${CMD_PREFIX_DESCRIPTION}`,

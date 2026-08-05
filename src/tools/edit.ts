@@ -26,6 +26,14 @@ import { createErrorResponse } from '../error-handlers.js';
 import { EditBlockArgsSchema, EditBlockMultipleArgsSchema } from "./schemas.js";
 import path from 'path';
 import { detectLineEnding, normalizeLineEndings, type LineEndingStyle } from '../utils/lineEndingHandler.js';
+import {
+    splitLines,
+    findHeadings,
+    matchHeadings,
+    resolveSection,
+    hashSectionBody,
+    type SectionRange
+} from '../utils/files/markdownSection.js';
 import { configManager } from '../config-manager.js';
 import { fuzzySearchLogger, type FuzzySearchLogEntry } from '../utils/fuzzySearchLogger.js';
 import { resolvePreviewFileType } from '../ui/file-preview/shared/preview-file-types.js';
@@ -508,11 +516,20 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
 
     const hasEditRange = 'editRange' in handler && typeof handler.editRange === 'function';
 
-    // Path 1: Range rewrite (Excel, etc.) — range + content
+    // Whether the handler owns old_string/new_string replacement for its file type — declared
+    // explicitly by each handler rather than inferred from having editRange(). See the comment
+    // on Path 2 below and FileHandler.ownsTextReplacement in utils/files/base.ts.
+    const ownsTextReplace = hasEditRange && (handler as { ownsTextReplacement?: boolean }).ownsTextReplacement === true;
+
+    // Path 1: Range rewrite (Excel cells, markdown sections, etc.) — range + content
     if (hasRange && hasContent) {
-        // Parse content if it's a JSON string (AI often sends arrays as JSON strings)
+        // Parse content if it's a JSON string (AI often sends arrays as JSON strings).
+        // Skipped when the handler wants raw text: a markdown section body is a plain string,
+        // and JSON.parse would mangle any body that happens to look like a JSON scalar
+        // (a section consisting of just `123` or `null` must stay literal text).
+        const wantsRawText = (handler as { rangeContentIsRawText?: boolean }).rangeContentIsRawText === true;
         let content = parsed.content;
-        if (typeof content === 'string') {
+        if (!wantsRawText && typeof content === 'string') {
             try {
                 content = JSON.parse(content);
             } catch {
@@ -523,7 +540,17 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
         if (hasEditRange) {
             try {
                 // parsed.range is guaranteed non-empty string by hasRange check above
-                await handler.editRange!(validatedPath!, parsed.range!, content, parsed.options);
+                const rangeResult = await handler.editRange!(validatedPath!, parsed.range!, content, parsed.options);
+
+                // Excel signals failure by throwing, but a handler may also report it in the
+                // result (markdown section mode returns success:false for a missing/ambiguous
+                // heading or a stale section hash). Ignoring that would report a refused edit
+                // as "Successfully updated" — the exact silent-success this mode exists to avoid.
+                if (rangeResult && rangeResult.success === false) {
+                    const why = rangeResult.errors?.map(e => e.error).join('; ') || 'edit was not applied';
+                    return createErrorResponse(why);
+                }
+
                 const resolvedRangePath = resolveAbsolutePath(parsed.file_path);
                 return {
                     content: [{
@@ -553,10 +580,17 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
         return createErrorResponse(`Text replacement requires both old_string and new_string parameters`);
     }
 
-    // If the handler implements editRange it owns text-replacement for its file type
+    // If the handler OWNS text-replacement for its file type it takes over here
     // (e.g. DocxFileHandler does find/replace on pretty-printed XML rather than raw bytes).
     // Plain text files fall through to performSearchReplace.
-    if (hasEditRange) {
+    //
+    // ⚠️ This asks `ownsTextReplacement`, NOT merely "does the handler have editRange".
+    // TextFileHandler now has editRange() for markdown SECTION addressing (range + content).
+    // Keying this branch on the method's existence would have silently rerouted EVERY text
+    // edit through it — losing fuzzy matching, the mixed-EOL diagnostics from 3a0d875 and
+    // the A-004 path-grouping fix in one stroke. The section path is reached only via
+    // Path 1 above (range + content); old_string always lands on performSearchReplace.
+    if (ownsTextReplace) {
         try {
             const result = await handler.editRange!(validatedPath!, '', {
                 old_string: parsed.old_string,
@@ -597,13 +631,18 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
 }
 
 /**
- * One edit in a batch request (text search/replace only).
+ * One edit in a batch request. Two mutually exclusive modes:
+ *  - text:    old_string + new_string (unchanged behaviour)
+ *  - section: range (markdown heading) + content + expected_section_hash
  */
 export interface MultiEditInput {
     file_path: string;
-    old_string: string;
-    new_string: string;
+    old_string?: string;
+    new_string?: string;
     expected_replacements?: number;
+    range?: string;
+    content?: string;
+    expected_section_hash?: string;
 }
 
 interface PerEditResult {
@@ -691,8 +730,100 @@ export async function editBlockMultiple(edits: MultiEditInput[]): Promise<Server
             const editResults: PerEditResult[] = [];
             let allOk = true;
 
+            // Section-mode edits are resolved BEFORE any of them is applied, against the
+            // single read above, then spliced back-to-front. Two reasons:
+            //  - back-to-front means an earlier splice never shifts a later section's
+            //    boundaries, so all offsets stay valid without re-parsing;
+            //  - resolving up front lets overlapping targets (a `##` and one of its own
+            //    `###` children) be rejected before a single byte is written, instead of
+            //    one silently swallowing the other.
+            // Because this whole block runs inside withFileLock with one read, the
+            // pre-check result cannot go stale before the write.
+            const sectionEdits = fileEdits
+                .map((ed, i) => ({ ed, i }))
+                .filter(x => x.ed.range !== undefined && x.ed.range !== '');
+
+            if (sectionEdits.length > 0) {
+                const lines = splitLines(running);
+                const headings = findHeadings(lines);
+                const resolved: Array<{ i: number; range: SectionRange; body: string }> = [];
+
+                for (const { ed, i } of sectionEdits) {
+                    const heading = ed.range!;
+                    const hits = matchHeadings(headings, heading);
+
+                    if (hits.length === 0) {
+                        editResults.push({ index: i, ok: false, count: 0, reason: `heading not found: "${heading}"` });
+                        allOk = false;
+                        continue;
+                    }
+                    if (hits.length > 1) {
+                        const where = hits.map(h => `line ${headings[h].lineIndex + 1}`).join(', ');
+                        editResults.push({
+                            index: i, ok: false, count: hits.length,
+                            reason: `heading is not unique: "${heading}" matches ${hits.length} headings (${where}) — ` +
+                                    'section mode cannot narrow by parent path; use old_string for this edit',
+                        });
+                        allOk = false;
+                        continue;
+                    }
+                    if (ed.expected_section_hash === undefined || ed.expected_section_hash === '') {
+                        editResults.push({
+                            index: i, ok: false, count: 1,
+                            reason: 'missing_section_hash: section mode requires expected_section_hash (sha256 of the current section body)',
+                        });
+                        allOk = false;
+                        continue;
+                    }
+
+                    const range = resolveSection(lines, headings, hits[0]);
+                    const actual = hashSectionBody(lines, range);
+                    if (actual !== ed.expected_section_hash) {
+                        editResults.push({
+                            index: i, ok: false, count: 1,
+                            reason: `stale_section: body changed since it was read (expected ${ed.expected_section_hash}, actual ${actual})`,
+                        });
+                        allOk = false;
+                        continue;
+                    }
+
+                    resolved.push({ i, range, body: ed.content ?? '' });
+                }
+
+                // Reject overlap rather than guessing an order. Sections are half-open
+                // [bodyStart, bodyEnd); a parent's range strictly contains its children's.
+                for (let a = 0; a < resolved.length && allOk; a++) {
+                    for (let b = a + 1; b < resolved.length; b++) {
+                        const x = resolved[a].range, y = resolved[b].range;
+                        const overlap = x.bodyStart < y.bodyEnd && y.bodyStart < x.bodyEnd;
+                        if (overlap) {
+                            for (const idx of [resolved[a].i, resolved[b].i]) {
+                                editResults.push({
+                                    index: idx, ok: false, count: 0,
+                                    reason: 'overlapping_sections: one target section contains another ' +
+                                            '(a heading and one of its own subheadings) — split into separate calls',
+                                });
+                            }
+                            allOk = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (allOk) {
+                    let out = lines;
+                    for (const r of resolved.sort((p, q) => q.range.bodyStart - p.range.bodyStart)) {
+                        const newBody = r.body === '' ? [] : splitLines(normalizeLineEndings(r.body, lineEnding));
+                        out = [...out.slice(0, r.range.bodyStart), ...newBody, ...out.slice(r.range.bodyEnd)];
+                        editResults.push({ index: r.i, ok: true, count: 1 });
+                    }
+                    running = out.join(lineEnding);
+                }
+            }
+
             for (let i = 0; i < fileEdits.length; i++) {
                 const ed = fileEdits[i];
+                if (ed.range !== undefined && ed.range !== '') continue;   // handled above
                 const expected = ed.expected_replacements ?? 1;
                 if (!ed.old_string) {
                     editResults.push({ index: i, ok: false, count: 0, reason: 'empty old_string' });

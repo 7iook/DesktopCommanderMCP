@@ -36,9 +36,10 @@ export interface FileHandler {
      * - Whole sheets: "Sheet1" to replace entire sheet
      * - Chunking: Update 1000 rows at a time for large files
      *
-     * Currently implemented by: ExcelFileHandler
-     * TECHNICAL DEBT: TextFileHandler should also implement this for search/replace
-     * (logic currently in src/tools/edit.ts - see comments there)
+     * Currently implemented by: ExcelFileHandler, DocxFileHandler, TextFileHandler
+     * (TextFileHandler's implementation covers markdown SECTION addressing only — its
+     * old_string/new_string path still lives in src/tools/edit.ts performSearchReplace;
+     * see ownsTextReplacement below.)
      *
      * @param path Validated file path
      * @param range Range identifier (e.g., "Sheet1!A1:C10" or "Sheet1")
@@ -47,6 +48,31 @@ export interface FileHandler {
      * @returns Result with success status
      */
     editRange?(path: string, range: string, content: any, options?: Record<string, any>): Promise<EditResult>;
+
+    /**
+     * Whether this handler owns old_string/new_string TEXT replacement for its file type.
+     *
+     * The edit_block dispatcher (src/tools/edit.ts) used to infer this from the mere presence
+     * of editRange(), which made adding editRange() to a handler a silent behaviour change for
+     * every text edit on that file type. It is now explicit:
+     *   true  → DOCX (find/replace over pretty-printed XML) and other handlers whose own
+     *           editRange() genuinely implements text replacement
+     *   false → TextFileHandler: its editRange() does markdown SECTION addressing only, while
+     *           old_string edits must keep flowing to performSearchReplace() (fuzzy matching,
+     *           mixed-EOL diagnostics, A-004 path grouping all live there)
+     * Absent is treated as false.
+     */
+    readonly ownsTextReplacement?: boolean;
+
+    /**
+     * Whether editRange()'s `content` must be handed over as a raw string.
+     *
+     * The dispatcher JSON.parse()es a string `content` because Excel callers routinely send a
+     * 2D array as JSON text. A markdown section body is plain prose, and a body that happens
+     * to be `123`, `null` or `[1,2]` would be silently turned into a non-string. Handlers that
+     * want the literal text set this true. Absent is treated as false.
+     */
+    readonly rangeContentIsRawText?: boolean;
 
     /**
      * Get file metadata

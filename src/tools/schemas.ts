@@ -294,15 +294,35 @@ export const EditBlockArgsSchema = z.object({
 );
 
 // Batch text edit across multiple files/positions in one call. The edit
-// counterpart of write_multiple_files (batch create). Text search/replace
-// only; for Excel/DOCX structured edits use edit_block per file.
+// counterpart of write_multiple_files (batch create). Two per-edit modes:
+//   text    — old_string + new_string (unchanged; same engine as edit_block)
+//   section — range (a markdown heading) + content, for whole-section rewrites
+// Modes are mutually exclusive per edit; a single call may mix both across edits.
+// For Excel structured edits use edit_block per file.
 export const EditBlockMultipleArgsSchema = z.object({
   edits: z.array(z.object({
     file_path: z.string(),
-    old_string: z.string(),
-    new_string: z.string(),
+    // Text mode
+    old_string: z.string().optional(),
+    new_string: z.string().optional(),
     expected_replacements: z.number().optional().default(1),
-  })).min(1),
+    // Section mode (markdown): address by heading, never by quoting the old body
+    range: z.string().optional(),
+    content: z.string().optional(),
+    // Optimistic concurrency token, REQUIRED in section mode: sha256 of the section
+    // body as last read. Section mode has no old_string to compare against, so without
+    // this a stale caller silently overwrites whatever landed in between.
+    expected_section_hash: z.string().optional(),
+  }).refine(
+    data => {
+      const hasText = data.old_string !== undefined && data.old_string !== '' && data.new_string !== undefined;
+      const hasSection = data.range !== undefined && data.range !== '' && data.content !== undefined;
+      // Exactly one mode. Both set is a caller bug worth failing loudly rather than
+      // silently preferring one — the two modes rewrite different amounts of the file.
+      return hasText !== hasSection;
+    },
+    { message: "Each edit needs either (old_string + new_string) or (range + content), not both" }
+  )).min(1),
 });
 
 // Send input to process schema
