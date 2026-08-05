@@ -47,6 +47,7 @@ import {
     ListProcessesArgsSchema,
     EditBlockArgsSchema,
     EditBlockMultipleArgsSchema,
+    EditLinesArgsSchema,
     GetUsageStatsArgsSchema,
     GiveFeedbackArgsSchema,
     StartSearchArgsSchema,
@@ -1080,6 +1081,64 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     openWorldHint: false,
                 },
             },
+            {
+                name: "edit_lines",
+                description: `
+                        Restructure LINES of a text file: move a block, resequence a numbered
+                        list, or apply one regex per line over a bounded range.
+
+                        USE THIS INSTEAD OF start_process for any of those. Doing them through
+                        PowerShell/Python means your content passes through a shell, where
+                        backticks, \`$var\`, and nested quotes get eaten — and the usual recovery
+                        (write a throwaway script, run it, delete it) costs several turns per
+                        edit. Arguments here arrive over MCP and are written directly, so
+                        backticks, fenced code blocks, CJK text and emoji are just bytes.
+
+                        THREE OPS, all taking file_path + startLine + endLine (1-based, inclusive):
+
+                        op: "move" — relocate lines startLine..endLine
+                        - afterLine: destination in ORIGINAL line numbers; the block lands right
+                          after it. Use 0 for the top of the file. A destination inside the moved
+                          range is rejected rather than guessed at.
+
+                        op: "renumber" — resequence "1." / "2)" style list markers in the range
+                        - startAt: first value (default 1)
+                        - Only the leading number token is rewritten. Indentation and the
+                          delimiter are preserved, and non-item lines (blanks, prose,
+                          continuations) are left alone. Use this after inserting an item into
+                          the middle of a list, instead of renumbering by hand.
+                        - expectedLines (optional): the number of list items you expect to find
+
+                        op: "replace_pattern" — apply a regex to each line in the range
+                        - pattern, replacement ($1 group refs supported), flags (optional)
+                        - expectedLines: REQUIRED — the exact number of lines you expect to
+                          change. A mismatch aborts with ZERO bytes written. An unbounded regex
+                          over a range is the single easiest way to damage a file, so the count
+                          is a contract rather than a hint.
+                        - The "m" and "s" flags are rejected: the pattern is applied per line, so
+                          multiline/dotAll would make the range boundaries meaningless.
+
+                        dry_run: true previews through the same code path that performs the write,
+                        so the preview is what you would get. Prefer it when unsure of a range.
+
+                        WHEN NOT TO USE THIS: replacing a specific known string is edit_block's
+                        job (it has fuzzy-match diagnostics this tool does not). Rewriting a whole
+                        markdown section by heading is edit_block's section mode. This tool is for
+                        when the change is about WHERE lines sit or how they are sequenced.
+
+                        Line numbers are read from the file as it is NOW: read_file first, and if
+                        another edit lands in between, re-read rather than reusing old numbers.
+
+                        ${PATH_GUIDANCE}
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(EditLinesArgsSchema),
+                annotations: {
+                    title: "Edit Lines",
+                    readOnlyHint: false,
+                    destructiveHint: true,
+                    openWorldHint: false,
+                },
+            },
 
             // Terminal tools
             {
@@ -1852,6 +1911,10 @@ async function handleCallToolRequest(request: CallToolRequest): Promise<ServerRe
 
             case "edit_block_multiple":
                 result = await handlers.handleEditBlockMultiple(args);
+                break;
+
+            case "edit_lines":
+                result = await handlers.handleEditLines(args);
                 break;
 
             default:

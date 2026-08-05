@@ -300,6 +300,29 @@ export const EditBlockArgsSchema = z.object({
   { message: "Must provide either (old_string + new_string) or (range + content)" }
 );
 
+// Line-structural editing: move / renumber / per-line regex. Exists because the only
+// previous route for these was shelling out to PowerShell or Python, where backtick and
+// nested-quote escaping repeatedly ate the content. Arguments arrive over MCP, so nothing
+// here is ever parsed by a shell.
+export const EditLinesArgsSchema = z.object({
+  file_path: z.string(),
+  op: z.enum(['move', 'renumber', 'replace_pattern']),
+  startLine: z.number().int().min(1),
+  endLine: z.number().int().min(1),
+  // move
+  afterLine: z.number().int().min(0).optional(),
+  // renumber
+  startAt: z.number().int().min(0).optional(),
+  // replace_pattern
+  pattern: z.string().optional(),
+  flags: z.string().optional(),
+  replacement: z.string().optional(),
+  expectedLines: z.number().int().min(0).optional(),
+  // Preview without writing. Same code path as the real edit, so what it shows is
+  // what a subsequent write produces.
+  dry_run: z.boolean().optional().default(false),
+});
+
 // Batch text edit across multiple files/positions in one call. The edit
 // counterpart of write_multiple_files (batch create). Two per-edit modes:
 //   text    — old_string + new_string (unchanged; same engine as edit_block)

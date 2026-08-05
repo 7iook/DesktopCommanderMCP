@@ -23,7 +23,7 @@ import { capture } from '../utils/capture.js';
 import { withFileLock } from '../utils/file-mutex.js';
 import { getFileHandler } from '../utils/files/index.js';
 import { createErrorResponse } from '../error-handlers.js';
-import { EditBlockArgsSchema, EditBlockMultipleArgsSchema } from "./schemas.js";
+import { EditBlockArgsSchema, EditBlockMultipleArgsSchema, EditLinesArgsSchema } from "./schemas.js";
 import path from 'path';
 import { detectLineEnding, normalizeLineEndings, type LineEndingStyle } from '../utils/lineEndingHandler.js';
 import {
@@ -34,6 +34,7 @@ import {
     hashSectionBody,
     type SectionRange
 } from '../utils/files/markdownSection.js';
+import { applyLineEdit } from '../utils/files/lineEdit.js';
 import { configManager } from '../config-manager.js';
 import { fuzzySearchLogger, type FuzzySearchLogEntry } from '../utils/fuzzySearchLogger.js';
 import { resolvePreviewFileType } from '../ui/file-preview/shared/preview-file-types.js';
@@ -628,6 +629,95 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
         search: parsed.old_string,
         replace: parsed.new_string
     }, parsed.expected_replacements, parsed.origin);
+}
+
+/**
+ * edit_lines — line-structural editing (move / renumber / per-line regex).
+ *
+ * The gap this closes: edit_block replaces a fixed string and write_file rewrites a whole
+ * file, so reordering lines or resequencing a numbered list had exactly one route — shell
+ * out to PowerShell/Python. That route is where multi-round document work bleeds time:
+ * shell escaping mangles backticks and nested quotes, and the recovery is to write a
+ * throwaway script, run it, delete it. Nothing here goes near a shell.
+ *
+ * Runs under withFileLock with one read and one write, matching edit_block_multiple, so a
+ * concurrent writer cannot land between the range check and the write.
+ */
+export async function handleEditLines(args: unknown): Promise<ServerResult> {
+    const parsed = EditLinesArgsSchema.safeParse(args);
+    if (!parsed.success) {
+        return createErrorResponse(`Invalid arguments for edit_lines: ${parsed.error}`);
+    }
+    const a = parsed.data;
+
+    let validPath: string;
+    try {
+        validPath = await validatePath(a.file_path);
+    } catch (error) {
+        return createErrorResponse(error instanceof Error ? error.message : String(error));
+    }
+
+    return withFileLock(validPath, async () => {
+        let content: string;
+        try {
+            const read = await readFileInternal(validPath, 0, Number.MAX_SAFE_INTEGER);
+            if (typeof read !== 'string') throw new Error('file content is not text');
+            content = read;
+        } catch (error) {
+            return createErrorResponse(
+                `read failed: ${error instanceof Error ? error.message : String(error)}`
+            );
+        }
+
+        const lineEnding = detectLineEnding(content);
+        const outcome = applyLineEdit(content, {
+            op: a.op,
+            startLine: a.startLine,
+            endLine: a.endLine,
+            afterLine: a.afterLine,
+            startAt: a.startAt,
+            pattern: a.pattern,
+            flags: a.flags,
+            replacement: a.replacement,
+            expectedLines: a.expectedLines,
+        }, lineEnding);
+
+        if (!outcome.ok) {
+            return createErrorResponse(`${a.op} failed: ${outcome.error} (file unchanged)`);
+        }
+
+        const previewText = outcome.preview.length
+            ? `\n${outcome.preview.join('\n')}`
+            : '\n(no visible line differences)';
+
+        if (a.dry_run) {
+            return {
+                content: [{
+                    type: "text",
+                    text: `DRY RUN — nothing written. ${a.op} would affect ` +
+                          `${outcome.linesAffected} line(s) in ${a.file_path}:${previewText}`
+                }],
+            };
+        }
+
+        try {
+            const handler = await getFileHandler(validPath);
+            await handler.write(validPath, outcome.content!, 'rewrite');
+        } catch (error) {
+            return createErrorResponse(
+                `write failed: ${error instanceof Error ? error.message : String(error)} (file unchanged)`
+            );
+        }
+
+        capture('server_edit_lines', { op: a.op, linesAffected: outcome.linesAffected });
+        return {
+            content: [{
+                type: "text",
+                text: `${a.op}: ${outcome.linesAffected} line(s) affected in ` +
+                      `${a.file_path}:${previewText}`
+            }],
+        };
+    });
 }
 
 /**
