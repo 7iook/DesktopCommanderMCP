@@ -6,6 +6,7 @@ import { configManager } from './config-manager.js';
 import {capture} from "./utils/capture.js";
 import { analyzeProcessState } from './utils/process-detection.js';
 import { markHotPathEnter, markHotPathExit } from './utils/main-thread-watchdog.js';
+import { ShellByteDecoder, extractClixmlRecords } from './utils/clixml.js';
 
 /**
  * Standard Windows PATHEXT value, used to repair a corrupted PATHEXT before
@@ -121,19 +122,28 @@ const POWERSHELL_UTF8_PREFIX =
  * failed and often just retries blindly.
  *
  * `$?` must be captured first: reading it is itself a statement, so consulting
- * $LASTEXITCODE beforehand would clobber it. The two are checked in order
- * because they cover different failures — a native program sets
- * $LASTEXITCODE, while a PowerShell-level failure (unknown command, failed
- * cmdlet) leaves it unset and only flips $?. Testing $LASTEXITCODE alone
- * would report success for a command that never ran.
+ * $LASTEXITCODE beforehand would clobber it.
+ *
+ * ORDER MATTERS, and the intuitive order is wrong. $LASTEXITCODE is STICKY:
+ * only a native executable ever writes it, and nothing clears it afterwards.
+ * A failing cmdlet flips $? to False but leaves $LASTEXITCODE holding whatever
+ * the last native command left behind — so `node -e "process.exit(0)"; Get-Item
+ * <missing>` checked $LASTEXITCODE first, found a stale 0, and reported SUCCESS
+ * for a command that failed. Combined with the CLIXML error text being dropped,
+ * that produced the worst possible signal: no output, exit code 0, command
+ * failed. So $? — which always reflects the LAST statement — is authoritative
+ * for failure, and $LASTEXITCODE only supplies the specific code.
+ *
+ * The remaining case is a native program that exits non-zero: it sets both, and
+ * $LASTEXITCODE gives the precise code (7, 127, 2) instead of a flat 1.
  *
  * Interactive sessions (python -i, node REPL) never reach this tail: those
  * commands don't return until the session is terminated.
  */
 const POWERSHELL_EXIT_CODE_SUFFIX =
   ';$__dcOk=$?;' +
-  'if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }' +
-  'elseif (-not $__dcOk) { exit 1 }' +
+  'if (-not $__dcOk) { if ($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 } }' +
+  'elseif ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }' +
   'else { exit 0 }';
 
 // NOTE on cmd.exe and CJK: cmd parses its command line using the OEM code
@@ -145,27 +155,32 @@ const POWERSHELL_EXIT_CODE_SUFFIX =
 // output should use `pwsh` or `powershell` instead.
 
 /**
- * Strip PowerShell CLIXML wire-format noise from captured output.
+ * Recover real text from PowerShell CLIXML envelopes and drop only the noise.
  *
  * When PowerShell's stdin is redirected (i.e. spawned as a child), it emits
- * a "#< CLIXML" header followed by `<Objs>` XML blocks for the progress /
+ * a "#< CLIXML" header followed by `<Objs>` XML blocks carrying its progress /
  * information / error streams. PS 5.1 emits these even with -OutputFormat
  * Text because module-loading progress fires BEFORE our $ProgressPreference
- * prefix runs. AI agents have no use for the XML; it just buries real output
- * in 1-2KB of `<Obj S="progress">` noise.
+ * prefix runs.
  *
- * Removes:
- *   - "#< CLIXML\r\n" header marker
- *   - any complete "<Objs ...>...</Objs>" XML blocks
- *   - resulting blank-line clusters at the very start of the output
+ * This used to delete whole `<Objs>...</Objs>` blocks, which was wrong in a way
+ * that mattered: one envelope carries progress records AND error records
+ * together, so deleting it destroyed every message PowerShell wrote to its
+ * error stream. A failing cmdlet (`Get-Item <missing>`), an unknown command, a
+ * `throw`, or any native stderr that got piped through PowerShell produced
+ * ZERO captured output — the caller saw an empty result and no reason for the
+ * failure, and typically resorted to re-running the command with its output
+ * teed to a file just to find out what went wrong.
  *
- * Leaves the actual user output (text between CLIXML envelopes) intact.
+ * So: keep `<S S="Error|Warning|Information|Verbose|Debug">` record text
+ * (unescaped back into real lines), drop `<Obj S="progress">` and the XML
+ * scaffolding around it.
  */
 function stripPsCliXml(text: string): string {
   if (!text || (!text.includes('#< CLIXML') && !text.includes('<Objs'))) return text;
   return text
     .replace(/#< CLIXML\r?\n/g, '')
-    .replace(/<Objs [\s\S]*?<\/Objs>/g, '')
+    .replace(/<Objs [\s\S]*?<\/Objs>/g, (block) => extractClixmlRecords(block))
     .replace(/^[\r\n]+/, '');
 }
 
@@ -448,6 +463,17 @@ export class TerminalManager {
       let resolved = false;
       let periodicCheck: NodeJS.Timeout | null = null;
 
+      // Decode stdout/stderr from BYTES rather than trusting data.toString()'s
+      // implicit UTF-8. PowerShell's CLIXML envelope and cmd.exe's own messages
+      // are emitted in the OEM code page (936/950/932/...) no matter what
+      // [Console]::OutputEncoding is set to — PS initializes its CLIXML writer
+      // before any injected prefix runs — so assuming UTF-8 turned every
+      // non-ASCII error message into mojibake. These decoders sniff per stream
+      // (valid UTF-8 stays UTF-8) and hold incomplete multi-byte sequences that
+      // land on a chunk boundary instead of corrupting the character.
+      const stdoutDecoder = new ShellByteDecoder();
+      const stderrDecoder = new ShellByteDecoder();
+
       // Quick prompt patterns for immediate detection
       const quickPromptPatterns = />>>\s*$|>\s*$|\$\s*$|#\s*$/;
 
@@ -485,7 +511,8 @@ export class TerminalManager {
       };
 
       childProcess.stdout.on('data', (data: any) => {
-        const text = data.toString();
+        const text = stdoutDecoder.write(Buffer.isBuffer(data) ? data : Buffer.from(data));
+        if (!text) return;
         const now = Date.now();
 
         if (!firstOutputTime) firstOutputTime = now;
@@ -531,7 +558,8 @@ export class TerminalManager {
       });
 
       childProcess.stderr.on('data', (data: any) => {
-        const text = data.toString();
+        const text = stderrDecoder.write(Buffer.isBuffer(data) ? data : Buffer.from(data));
+        if (!text) return;
         const now = Date.now();
 
         if (!firstOutputTime) firstOutputTime = now;
@@ -587,6 +615,13 @@ export class TerminalManager {
 
       childProcess.on('exit', (code: any) => {
         if (childProcess.pid) {
+          // Flush any bytes held back mid-character by the byte decoders, then
+          // any carried-but-incomplete CLIXML fragment. Order matters: decoded
+          // bytes may complete the CLIXML construct the filter is holding.
+          const tailBytes = stdoutDecoder.flush() + stderrDecoder.flush();
+          if (tailBytes) {
+            this.appendToLineBuffer(session, this.filterCliXmlStream(session, tailBytes));
+          }
           // Flush any carried-but-incomplete CLIXML fragment. Run it through
           // the block stripper once more (recovers real text that was carried
           // on a false positive); genuine dangling noise is near-impossible
@@ -655,10 +690,10 @@ export class TerminalManager {
     let buf = (session.cliXmlCarry ?? '') + text;
     session.cliXmlCarry = '';
 
-    // Drop complete header markers and complete <Objs>...</Objs> blocks.
+    // Drop header markers; recover record text from complete <Objs> blocks.
     buf = buf
       .replace(/#< CLIXML\r?\n/g, '')
-      .replace(/<Objs [\s\S]*?<\/Objs>/g, '');
+      .replace(/<Objs [\s\S]*?<\/Objs>/g, (block) => extractClixmlRecords(block));
 
     // Carry an incomplete trailing "<Objs ..." (opened, not yet closed).
     const openIdx = buf.lastIndexOf('<Objs');
