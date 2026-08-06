@@ -33,6 +33,7 @@ import {
     hashSectionBody,
     normalizeHeading
 } from './markdownSection.js';
+import { findLeftovers, formatLeftovers } from './leftoverScan.js';
 
 // TODO: Centralize these constants with filesystem.ts to avoid silent drift
 // These duplicate concepts from filesystem.ts and should be moved to a shared
@@ -597,7 +598,21 @@ export class TextFileHandler implements FileHandler {
         ].join(lineEnding);
 
         await fs.writeFile(path, updated, 'utf8');
-        return { success: true, editsApplied: 1 };
+
+        // Surface any distinctive name from the body just removed that still appears
+        // elsewhere in the file. Computed against the CONTENT AS WRITTEN and excluding the
+        // region this edit produced, so the caller only sees mentions it did not just author.
+        const removedBody = lines.slice(section.bodyStart, section.bodyEnd).join('\n');
+        const newBodyEnd = section.bodyStart + newBody.length;
+        const leftovers = findLeftovers(
+            removedBody,
+            updated,
+            section.heading.lineIndex + 1,   // 1-based: the heading line
+            newBodyEnd                        // 1-based inclusive end of the new body
+        );
+
+        const notes = formatLeftovers(leftovers);
+        return { success: true, editsApplied: 1, ...(notes.length ? { notes } : {}) };
     }
 }
 

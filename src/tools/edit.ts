@@ -35,6 +35,7 @@ import {
     type SectionRange
 } from '../utils/files/markdownSection.js';
 import { applyLineEdit } from '../utils/files/lineEdit.js';
+import { findLeftovers, formatLeftovers } from '../utils/files/leftoverScan.js';
 import { configManager } from '../config-manager.js';
 import { fuzzySearchLogger, type FuzzySearchLogEntry } from '../utils/fuzzySearchLogger.js';
 import { resolvePreviewFileType } from '../ui/file-preview/shared/preview-file-types.js';
@@ -553,10 +554,14 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
                 }
 
                 const resolvedRangePath = resolveAbsolutePath(parsed.file_path);
+                // Advisory notes (e.g. a name from the removed text still present elsewhere)
+                // ride along with the success message rather than in a separate channel — a
+                // warning the caller has to go looking for is one it will not read.
+                const noteText = rangeResult?.notes?.length ? `\n${rangeResult.notes.join('\n')}` : '';
                 return {
                     content: [{
                         type: "text",
-                        text: `Successfully updated range ${parsed.range} in ${parsed.file_path}`
+                        text: `Successfully updated range ${parsed.range} in ${parsed.file_path}${noteText}`
                     }],
                     ...(parsed.origin === 'ui' ? {
                         structuredContent: {
@@ -787,6 +792,8 @@ export async function editBlockMultiple(edits: MultiEditInput[]): Promise<Server
         appliedCount: number;   // edits applied in memory
         editResults: PerEditResult[];
         error?: string;         // file-level error (e.g. path/read failure)
+        /** Advisory leftover notes from section edits; never a failure. */
+        notes?: string[];
     }
 
     const runFile = async (file_path: string, fileEdits: MultiEditInput[]): Promise<FileOutcome> => {
@@ -818,6 +825,7 @@ export async function editBlockMultiple(edits: MultiEditInput[]): Promise<Server
             const lineEnding = detectLineEnding(content);
             let running = content;
             const editResults: PerEditResult[] = [];
+            const sectionNotes: string[] = [];
             let allOk = true;
 
             // Section-mode edits are resolved BEFORE any of them is applied, against the
@@ -902,12 +910,24 @@ export async function editBlockMultiple(edits: MultiEditInput[]): Promise<Server
 
                 if (allOk) {
                     let out = lines;
+                    // Collected before splicing: once the body is replaced the old text is
+                    // gone, and it is what the leftover scan needs.
+                    const removedBodies: string[] = [];
                     for (const r of resolved.sort((p, q) => q.range.bodyStart - p.range.bodyStart)) {
+                        removedBodies.push(out.slice(r.range.bodyStart, r.range.bodyEnd).join('\n'));
                         const newBody = r.body === '' ? [] : splitLines(normalizeLineEndings(r.body, lineEnding));
                         out = [...out.slice(0, r.range.bodyStart), ...newBody, ...out.slice(r.range.bodyEnd)];
                         editResults.push({ index: r.i, ok: true, count: 1 });
                     }
                     running = out.join(lineEnding);
+
+                    // Scan once over the final content rather than per section: after several
+                    // splices the line numbers have shifted, so a per-section skip range would
+                    // be wrong. Skipping nothing means a name the caller deliberately kept in a
+                    // NEW body can also surface — acceptable, since these are advisory and the
+                    // alternative is tracking every shifted offset for no real gain.
+                    const lo = findLeftovers(removedBodies.join('\n'), running, 0, 0);
+                    sectionNotes.push(...formatLeftovers(lo));
                 }
             }
 
@@ -974,6 +994,7 @@ export async function editBlockMultiple(edits: MultiEditInput[]): Promise<Server
                 ok: allOk,
                 appliedCount: editResults.filter(r => r.ok).length,
                 editResults,
+                ...(sectionNotes.length ? { notes: sectionNotes } : {}),
             };
         });
     };
@@ -995,6 +1016,9 @@ export async function editBlockMultiple(edits: MultiEditInput[]): Promise<Server
     for (const o of outcomes) {
         if (o.ok) {
             lines.push(`✅ ${o.file_path} (${o.appliedCount} edit${o.appliedCount === 1 ? '' : 's'} applied)`);
+            // Advisory only, and only on success: a name from a removed section body that is
+            // still present elsewhere. Indented under the file it belongs to.
+            if (o.notes?.length) for (const n of o.notes) lines.push(n ? `   ${n}` : '');
         } else {
             const failed = o.editResults.filter(r => !r.ok);
             const head = o.error

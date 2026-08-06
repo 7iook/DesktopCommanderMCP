@@ -210,6 +210,17 @@ export interface EditResult {
     /** Number of edits successfully applied */
     editsApplied: number;
 
+    /**
+     * Advisory notes about the edit that succeeded — never a failure.
+     *
+     * Added for leftover detection: after replacing a block, distinctive names taken from
+     * the removed text may still appear elsewhere in the file. That is the shape of the
+     * costliest defect in multi-round document work (the edit lands, a stale copy survives,
+     * and nothing notices until the next review round), and it is mechanical to detect.
+     * Purely informational — a hit can equally be a deliberate historical note.
+     */
+    notes?: string[];
+
     /** Errors that occurred during editing */
     errors?: Array<{
         location: string;

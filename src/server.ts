@@ -990,6 +990,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         a few lines; a wrong section edit destroys the ENTIRE section. Prefer the mode whose
                         failure is smaller.
 
+                        A successful section edit may append "Still mentioned elsewhere in this
+                        file": a distinctive name taken from the body you just replaced that still
+                        appears in other sections, with line numbers. This catches the costly
+                        failure mode where the edit lands but a stale copy of the same claim
+                        survives in a layering table or test matrix and is only noticed a review
+                        round later. It is ADVISORY and makes no judgement — a hit is equally
+                        likely to be a deliberate historical note ("superseded in R4"). Read the
+                        cited lines and decide; the edit already succeeded either way.
+
                         For N section rewrites use edit_block_multiple, which accepts range/content per edit
                         and applies them in ONE call: all sections are resolved against a single read, then
                         spliced back-to-front so an earlier rewrite cannot shift a later section's boundary.
