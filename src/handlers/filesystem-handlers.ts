@@ -251,9 +251,21 @@ export async function handleReadFile(args: unknown): Promise<ServerResult> {
 
 /**
  * Handle read_multiple_files command
+ *
+ * Shares read_file's char cap (responseMaxChars) across the whole batch. Without
+ * it this was the last uncapped read path: N files x full content, straight into
+ * host context. Hosts that don't auto-truncate (Kiro IDE) lock up; hosts that do
+ * (Claude Code) spill the result to a side file, so the AI pays an extra read to
+ * get anything back.
+ *
+ * Budget is spent in call order and never silently swallows a file: whatever
+ * doesn't fit is reported by path with the read_file call that fetches it. A
+ * truncated batch must never look like a batch of empty files.
  */
 export async function handleReadMultipleFiles(args: unknown): Promise<ServerResult> {
     const parsed = ReadMultipleFilesArgsSchema.parse(args);
+    const config = await configManager.getConfig();
+    const responseMaxChars = config.responseMaxChars ?? 50000;
     const fileResults = await readMultipleFiles(parsed.paths);
 
     // Create a text summary of all files
@@ -274,6 +286,16 @@ export async function handleReadMultipleFiles(args: unknown): Promise<ServerResu
 
     // Add the text summary
     contentItems.push({ type: "text", text: textSummary });
+
+    // Text budget shared by every text body below. The summary is always kept
+    // (it is the index the AI needs to know what it did and didn't receive);
+    // image / PDF payloads are not text and are left alone, matching read_file.
+    let remainingChars = Math.max(0, responseMaxChars - textSummary.length);
+    // Below this a partial body is more confusing than useful — report the file
+    // as omitted with its read_file call instead of handing back a stub.
+    const MIN_USEFUL_SLICE = 500;
+    const truncatedPaths: string[] = [];
+    const omittedPaths: string[] = [];
 
     // Add each file content
     for (const result of fileResults) {
@@ -301,12 +323,47 @@ export async function handleReadMultipleFiles(args: unknown): Promise<ServerResu
                 });
             } else {
                 // For text files, add a text summary
-                contentItems.push({
-                    type: "text",
-                    text: `\n--- ${result.path} contents: ---\n${result.content}`
-                });
+                const header = `\n--- ${result.path} contents: ---\n`;
+                const budgetForBody = remainingChars - header.length;
+                if (budgetForBody >= result.content.length) {
+                    contentItems.push({
+                        type: "text",
+                        text: `${header}${result.content}`
+                    });
+                    remainingChars -= header.length + result.content.length;
+                } else if (budgetForBody >= MIN_USEFUL_SLICE) {
+                    // Partial body: reuse read_file's cap so minified files get the
+                    // same "offset/length cannot slice within one line" guidance.
+                    const capped = applyReadFileCharCap(result.content, budgetForBody);
+                    contentItems.push({
+                        type: "text",
+                        text: `${header}${capped.text}`
+                    });
+                    truncatedPaths.push(result.path);
+                    remainingChars = 0;
+                } else {
+                    omittedPaths.push(result.path);
+                    remainingChars = 0;
+                }
             }
         }
+    }
+
+    if (truncatedPaths.length > 0 || omittedPaths.length > 0) {
+        const notes: string[] = [
+            `[Batch capped at ${responseMaxChars} chars — NOT every file below is complete.]`
+        ];
+        if (truncatedPaths.length > 0) {
+            notes.push(`Truncated (partial content shown): ${truncatedPaths.join(', ')}`);
+        }
+        if (omittedPaths.length > 0) {
+            notes.push(`Content NOT included (listed in the summary above, body omitted): ${omittedPaths.join(', ')}`);
+        }
+        notes.push(
+            `Fetch any of these in full with read_file (paginate with offset/length), ` +
+            `split the batch into smaller calls, or raise the cap: set_config_value("responseMaxChars", <larger>).`
+        );
+        contentItems.push({ type: "text", text: `\n${notes.join('\n')}` });
     }
 
     return { content: contentItems };

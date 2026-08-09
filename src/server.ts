@@ -440,6 +440,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         
                         Failed reads for individual files won't stop the entire operation.
                         Only works within allowed directories.
+
+                        The combined text is capped (responseMaxChars, default 50000) so a big
+                        batch can't overflow the conversation. The summary always lists every
+                        file; bodies are filled in call order until the budget runs out, and a
+                        trailing note names any file whose content was truncated or omitted.
+                        A capped batch is NEVER silently short — if you see that note, fetch
+                        those files with read_file or split the batch.
                         
                         ${PATH_GUIDANCE}
                         ${CMD_PREFIX_DESCRIPTION}`,
