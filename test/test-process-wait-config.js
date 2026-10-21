@@ -19,7 +19,7 @@ import { MAX_PROCESS_WAIT_MS } from '../dist/config.js';
 import { getProcessWaitLimit } from '../dist/terminal-manager.js';
 import { getConfig, setConfigValue } from '../dist/tools/config.js';
 import { validatePath } from '../dist/tools/filesystem.js';
-import { startProcess, interactWithProcess, forceTerminate } from '../dist/tools/improved-process-tools.js';
+import { startProcess, interactWithProcess, interactWithProcessLines, readProcessOutput, forceTerminate } from '../dist/tools/improved-process-tools.js';
 import { runIfMain, skip } from './helpers/run-if-main.js';
 import { isTestHome } from './helpers/test-env.js';
 
@@ -153,6 +153,49 @@ async function testNodeLocalWaitsWithinTheCeiling() {
   console.log('ok: a node:local script ends at the wait ceiling');
 }
 
+async function testTailFollowWaitsWithinTheCeiling() {
+  console.log('\n--- Test 6: a tail read with follow_ms waits within the ceiling too ---');
+  // A small ceiling stands in for MAX_PROCESS_WAIT_MS; the silent process never ends the follow early
+  const CAP_MS = 300;
+  const FOLLOW_MS = 4000;
+  const started = await startProcess({ command: 'node -e "setTimeout(() => {}, 8000)"', timeout_ms: 500 });
+  const pid = started.structuredContent?.pid;
+  assert.ok(pid > 0, `start_process should start node, got: ${started.content[0].text}`);
+  try {
+    const t0 = Date.now();
+    await readProcessOutput({ pid, offset: -10, follow_ms: FOLLOW_MS }, CAP_MS);
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < FOLLOW_MS / 2,
+      `a tail read with follow_ms=${FOLLOW_MS} waited ${elapsed}ms, past the ${CAP_MS}ms wait ceiling`);
+  } finally {
+    await forceTerminate({ pid });
+  }
+  console.log('ok: follow_ms on a tail read ends at the wait ceiling');
+}
+
+async function testLineByLineWaitsWithinTheCeiling() {
+  console.log('\n--- Test 7: interact_with_process_lines waits within the ceiling as a whole ---');
+  // Each line may wait 2 s for a prompt that never comes; three of them must not add up past the ceiling
+  const CAP_MS = 500;
+  const started = await startProcess({ command: 'node -e "process.stdin.resume(); setTimeout(() => {}, 8000)"', timeout_ms: 500 });
+  const pid = started.structuredContent?.pid;
+  assert.ok(pid > 0, `start_process should start node, got: ${started.content[0].text}`);
+  try {
+    const t0 = Date.now();
+    const result = await interactWithProcessLines({
+      pid, fail_fast: false,
+      lines: [{ input: 'a', timeout_ms: 2000 }, { input: 'b', timeout_ms: 2000 }, { input: 'c', timeout_ms: 2000 }],
+    }, CAP_MS);
+    const elapsed = Date.now() - t0;
+    const text = result.content[0].text;
+    assert.ok(elapsed < 1500, `three 2 s line waits took ${elapsed}ms, past the ${CAP_MS}ms wait ceiling: ${text}`);
+    assert.match(text, /wait ceiling/, `the answer should say the ceiling stopped it, got: ${text}`);
+  } finally {
+    await forceTerminate({ pid });
+  }
+  console.log('ok: line-by-line waits end at the wait ceiling and say so');
+}
+
 // The settings these tests change: they must be left as they were found
 const CHANGED_SETTINGS = ['fileReadLineLimit', 'allowedDirectories', 'blockedCommands'];
 
@@ -169,6 +212,8 @@ async function runAllTests() {
   await testNullOnArrayFields();
   await testCappedWaitAnswers();
   await testNodeLocalWaitsWithinTheCeiling();
+  await testTailFollowWaitsWithinTheCeiling();
+  await testLineByLineWaitsWithinTheCeiling();
   const after = await configManager.getConfig();
   for (const key of CHANGED_SETTINGS) {
     assert.deepStrictEqual(after[key], before[key],

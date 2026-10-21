@@ -125,7 +125,7 @@ const RULES: Rule[] = [
     description: 'write_file rewrite of an existing file rejected by overwrite-protection',
     severity: 'info',
     appliesTo: ['write_file', 'write_multiple_files'],
-    suggestion: 'Use edit_block for surgical changes, or pass mode:"append", or explicitly allowOverwrite:true if rewrite is intentional',
+    suggestion: 'Use edit_block for surgical changes, or pass mode:"append", or pass mode:"rewrite" + allowOverwrite:true together if rewrite is intentional',
     match: (r) => {
       const out = getOutputText(r);
       if (/writeFileOverwriteProtection|refus(?:e|ing) to overwrite|allowOverwrite/i.test(out)) {

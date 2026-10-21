@@ -410,6 +410,12 @@ export function groupKeyForPath(filePath: string): string {
     return normalizePathKey(resolveAbsolutePath(filePath));
 }
 
+// The one argument set that replaces an existing file regardless of which
+// guard fired. Both rejections quote it verbatim: each guard used to suggest
+// only its own half (mode / allowOverwrite), so a caller following either
+// hint hit the other guard and needed three calls to replace one file.
+const REPLACE_RETRY_ARGS = "mode:'rewrite', allowOverwrite:true";
+
 async function writeOneFile(entry: WriteEntry, protectionEnabled: boolean, maxLines: number): Promise<WriteOutcome> {
     // Overwrite protection: rewrite of an existing file requires allowOverwrite.
     if (entry.mode === 'rewrite' && !entry.allowOverwrite && protectionEnabled) {
@@ -420,7 +426,7 @@ async function writeOneFile(entry: WriteEntry, protectionEnabled: boolean, maxLi
             if (stat.isFile() && stat.size > 0) {
                 return {
                     path: entry.path, ok: false, mode: entry.mode,
-                    error: `File already exists (${stat.size} bytes); rewrite would overwrite it. Use edit_block, mode:'append', or allowOverwrite:true.`
+                    error: `File already exists (${stat.size} bytes); rewrite would overwrite it. Retry with ${REPLACE_RETRY_ARGS} to replace it, mode:'append' to add to the end, or use edit_block.`
                 };
             }
         } catch (err: any) {
@@ -456,8 +462,9 @@ export async function handleWriteFile(args: unknown): Promise<ServerResult> {
         // the target's existing content. The common failure is an LLM caller
         // intending to append but dropping the optional param (issue #541), so
         // require explicit intent when the target already has content;
-        // new/empty files keep the zero-friction default.
-        if (!modeProvided) {
+        // new/empty files keep the zero-friction default. allowOverwrite:true
+        // already states the intent to replace, so it satisfies this guard.
+        if (!modeProvided && !parsed.allowOverwrite) {
             let existing: Record<string, any> | null = null;
             try {
                 existing = await getFileInfo(parsed.path);
@@ -469,9 +476,10 @@ export async function handleWriteFile(args: unknown): Promise<ServerResult> {
                 return createErrorResponse(
                     `Write rejected to prevent accidental data loss: ${parsed.path} already exists ` +
                     `with content (${existing.size} bytes), and no 'mode' was specified — the default ` +
-                    `mode 'rewrite' would REPLACE the entire file. Retry with an explicit mode: ` +
-                    `'append' to add your content to the end of the existing file, or 'rewrite' ` +
-                    `to replace all existing content.`
+                    `mode 'rewrite' would REPLACE the entire file. Retry with ONE of:\n` +
+                    `  • mode:'append' to add your content to the end of the existing file\n` +
+                    `  • ${REPLACE_RETRY_ARGS} to replace all existing content\n` +
+                    `  • edit_block to change only part of the file`
                 );
             }
         }
@@ -497,7 +505,7 @@ write_file with mode='rewrite' would OVERWRITE the entire file.
 Choose one:
   • Surgical edit (recommended) → use edit_block with old_string + new_string
   • Append at end → call write_file again with mode:'append'
-  • Intentional full overwrite → set allowOverwrite:true and retry
+  • Intentional full overwrite → call write_file again with ${REPLACE_RETRY_ARGS}
 
 Disable this guard globally:
   set_config_value("writeFileOverwriteProtection", false)`

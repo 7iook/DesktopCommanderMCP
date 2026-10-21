@@ -588,7 +588,8 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
         const now = terminalManager.getOutputCharCount(pid) || 0;
         if (now > charBaseline || !terminalManager.getSession(pid)) finish();
       }, 50);
-      const to = setTimeout(finish, follow_ms);
+      // Same per-call ceiling as the offset===0 wait below: a large follow_ms must not outlive the client's request timeout
+      const to = setTimeout(finish, Math.min(follow_ms, waitMs));
     });
   }
 
@@ -1099,7 +1100,7 @@ function tailMatchesPrompt(text: string, re: RegExp): boolean {
  * Node readline, shell `read`) would otherwise consume queued newlines before
  * its prompts have flushed, so every later line lands on the wrong prompt.
  */
-export async function interactWithProcessLines(args: unknown): Promise<ServerResult> {
+export async function interactWithProcessLines(args: unknown, maxWaitMs: number = MAX_PROCESS_WAIT_MS): Promise<ServerResult> {
   const parsed = InteractWithProcessLinesArgsSchema.safeParse(args);
   if (!parsed.success) {
     return {
@@ -1138,6 +1139,9 @@ export async function interactWithProcessLines(args: unknown): Promise<ServerRes
   capture('server_interact_with_process_lines', { pid, lineCount: lines.length });
 
   const startTime = Date.now();
+  // One ceiling for the whole call, like every other process wait: per-line
+  // waits add up, and an answer past the client's request timeout is lost.
+  const callDeadline = startTime + maxWaitMs;
 
   // Compile the regex once per distinct source (cheap; lines is small).
   const compile = (src: string | undefined): RegExp =>
@@ -1158,6 +1162,12 @@ export async function interactWithProcessLines(args: unknown): Promise<ServerRes
     const useDelay = typeof line.delay_after_ms === 'number';
     const re = compile(line.wait_for ?? default_wait_for);
 
+    if (i > 0 && Date.now() >= callDeadline) {
+      aborted = true;
+      abortReason = `Stopped before line ${i + 1}: this call reached its ${maxWaitMs}ms wait ceiling. Send the remaining ${lines.length - i} line(s) in another interact_with_process_lines call.`;
+      break;
+    }
+
     const lineSnapshot = terminalManager.captureOutputSnapshot(pid);
     const lineStart = Date.now();
 
@@ -1174,11 +1184,11 @@ export async function interactWithProcessLines(args: unknown): Promise<ServerRes
     let matched = false;
     let reason = 'prompt-matched';
     if (useDelay) {
-      await sleep(line.delay_after_ms as number);
+      await sleep(Math.max(0, Math.min(line.delay_after_ms as number, callDeadline - Date.now())));
       matched = true;
       reason = 'delay';
     } else {
-      const deadline = Date.now() + lineTimeout;
+      const deadline = Math.min(Date.now() + lineTimeout, callDeadline);
       while (Date.now() < deadline) {
         // Process gone? stop waiting — final state handled after loop.
         if (!terminalManager.getSession(pid) && !isPidAlive(pid)) {
@@ -1192,7 +1202,7 @@ export async function interactWithProcessLines(args: unknown): Promise<ServerRes
         }
         await sleep(30);
       }
-      if (!matched && reason === 'prompt-matched') reason = 'timeout';
+      if (!matched && reason === 'prompt-matched') reason = Date.now() >= callDeadline ? 'wait-ceiling' : 'timeout';
     }
 
     const lineOut = lineSnapshot ? (terminalManager.getOutputSinceSnapshot(pid, lineSnapshot) ?? '') : '';
@@ -1246,6 +1256,12 @@ export async function interactWithProcessLines(args: unknown): Promise<ServerRes
     if (reason === 'process-exited') {
       aborted = true;
       abortReason = `Process ${pid} exited while waiting after line ${i + 1}.`;
+      break;
+    }
+    // Regardless of fail_fast: the call has no time left to wait for anything.
+    if (reason === 'wait-ceiling') {
+      aborted = true;
+      abortReason = `Line ${i + 1} was still waiting for a prompt when this call reached its ${maxWaitMs}ms wait ceiling. Check the output, then send the remaining ${lines.length - i - 1} line(s) in another call.`;
       break;
     }
 

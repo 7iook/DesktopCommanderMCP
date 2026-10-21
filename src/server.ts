@@ -480,6 +480,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         - Files over 50 lines are still written successfully but may generate performance notes.
                         - For continuation after a partial write, the existing file state can be inspected before appending the remaining content.
 
+                        EXISTING FILES (overwrite protection):
+                        - New or empty file: mode may be omitted.
+                        - Add to the end of an existing file: mode:'append'.
+                        - Replace an existing file: mode:'rewrite' AND allowOverwrite:true (both, in one call).
+                        - Change only part of a file: use edit_block instead.
+
                         FORMAT HANDLING (by extension):
                         - Text files: String content
                         - Excel (.xlsx, .xls, .xlsm): JSON 2D array or {"SheetName": [[...]]}
