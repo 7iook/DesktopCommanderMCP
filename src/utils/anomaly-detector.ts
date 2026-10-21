@@ -6,7 +6,9 @@
  * and recurring failure modes. Pure functions — no side effects, no I/O,
  * no hidden state. Detection is run on demand from the
  * `get_recent_anomalies` tool, NOT on every addCall (we don't want to
- * pay rule-evaluation cost on the hot path).
+ * pay rule-evaluation cost on the hot path). The one exception: when
+ * toolHistory caps an oversized output, it runs the rules on the full output
+ * first and keeps the result as `anomalyMarks` (the marker has no text left).
  *
  * Rules accumulate in this file as we ship fixes — every time we patch
  * a real-world AI mistake (cmd timeout trap, nested PS $var swallowing,
@@ -33,6 +35,12 @@ export interface AnomalyHit {
    */
   context: string;
   suggestion: string;
+}
+
+/** The part of a hit worth storing; the rest comes from the rule by id. */
+export interface AnomalyMark {
+  ruleId: string;
+  context: string;
 }
 
 interface Rule {
@@ -225,6 +233,16 @@ const RULES: Rule[] = [
  */
 export function detectAnomalies(record: ToolCallRecord): AnomalyHit[] {
   if (!record || !record.toolName) return [];
+  // History capped this record's output and kept what the full output showed
+  if (record.anomalyMarks) {
+    return record.anomalyMarks.flatMap(mark => {
+      const rule = RULES.find(r => r.id === mark.ruleId);
+      return rule ? [{
+        ruleId: rule.id, ruleDescription: rule.description, toolName: record.toolName,
+        timestamp: record.timestamp, severity: rule.severity, context: mark.context, suggestion: rule.suggestion,
+      }] : [];
+    });
+  }
   const hits: AnomalyHit[] = [];
   let specificMatched = false;
 

@@ -566,6 +566,9 @@ export class TerminalManager {
    * buffer, and to that stream's tail for state detection.
    */
   private recordOutput(session: ManagedSession, stream: OutputStream, text: string): void {
+    // A chunk the CLIXML filter reduced to nothing wrote nothing: stamping its
+    // turn would make the stream's old tail (e.g. a stale ">>> ") the latest output.
+    if (!text) return;
     this.appendToLineBuffer(session, text);
     const tail = session.streams[stream];
     tail.text = (text.length >= STATE_DETECTION_TAIL_CHARS ? text : tail.text + text).slice(-STATE_DETECTION_TAIL_CHARS);

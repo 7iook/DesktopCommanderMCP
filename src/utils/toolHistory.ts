@@ -1,4 +1,5 @@
 import { ServerResult } from '../types.js';
+import { detectAnomalies, type AnomalyMark } from './anomaly-detector.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -9,6 +10,9 @@ export interface ToolCallRecord {
   arguments: any;
   output: ServerResult;
   duration?: number;
+  // Set only when capOutput replaced the output: what the anomaly rules found
+  // in the full output, which the omission marker no longer carries.
+  anomalyMarks?: AnomalyMark[];
 }
 
 interface FormattedToolCallRecord extends Omit<ToolCallRecord, 'timestamp'> {
@@ -272,13 +276,20 @@ class ToolHistory {
     output: ServerResult,
     duration?: number
   ): void {
+    const stored = this.capOutput(output);
     const record: ToolCallRecord = {
       timestamp: new Date().toISOString(),
       toolName,
       arguments: args,
-      output: this.capOutput(output),
+      output: stored,
       duration
     };
+    if (stored !== output) {
+      // Judge the full output now, while it still exists. Only oversized
+      // calls pay this; everything else is judged on demand as before.
+      const marks = detectAnomalies({ ...record, output }).map(h => ({ ruleId: h.ruleId, context: h.context }));
+      if (marks.length > 0) record.anomalyMarks = marks;
+    }
 
     this.history.push(record);
 
