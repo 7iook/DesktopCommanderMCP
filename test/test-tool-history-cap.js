@@ -54,9 +54,13 @@ async function main() {
     assert(recs !== null, 'capped response is still valid JSON');
     const mine = (recs || []).filter(r => r.toolName === HEAVY);
     assert(mine.length > 0, 'heavy records present');
-    assert(mine.every(r => typeof r.output?._note === 'string' && r.output._note.includes('output omitted')),
+    // Two layers bound this since the v0.3.0 merge: upstream ToolHistory caps the
+    // stored output to a short "[output omitted from history ...]" marker, and our
+    // handler preview (_note) covers anything still over its own threshold.
+    const omittedNote = (r) => r.output?._note ?? r.output?.content?.[0]?.text ?? '';
+    assert(mine.every(r => omittedNote(r).includes('output omitted')),
       'every heavy record states its output was omitted');
-    assert(mine.every(r => r.output?._note?.includes('re-run the tool')),
+    assert(mine.every(r => r.output?._note ? r.output._note.includes('re-run the tool') : omittedNote(r).includes('over the')),
       'each note tells the AI how to get the real content');
     assert(mine.every(r => !JSON.stringify(r.output).includes('x'.repeat(1000))),
       'no heavy payload replayed in any record');
@@ -70,7 +74,8 @@ async function main() {
     recs = recordsOf(textOf(await handleGetRecentToolCalls({ maxResults: 5, toolName: ERRING })));
     const errRec = (recs || []).find(r => r.toolName === ERRING);
     assert(errRec?.output?.isError === true, 'isError preserved through the preview');
-    assert(typeof errRec?.output?.firstTextPreview === 'string' && errRec.output.firstTextPreview.length <= 800,
+    const errText = errRec?.output?.firstTextPreview ?? errRec?.output?.content?.[0]?.text;
+    assert(typeof errText === 'string' && errText.length <= 800,
       'error text preview kept but bounded');
   } catch (err) {
     console.log(`${col.red}Unexpected: ${err.stack || err}${col.reset}`); failures++;

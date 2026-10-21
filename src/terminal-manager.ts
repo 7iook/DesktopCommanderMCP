@@ -1,10 +1,11 @@
-import { spawn, execFile } from 'child_process';
-import path from 'path';
+import { spawn } from 'child_process';
 import { TerminalSession, CommandExecutionResult, ActiveSession, TimingInfo, OutputEvent } from './types.js';
-import { DEFAULT_COMMAND_TIMEOUT } from './config.js';
-import { configManager } from './config-manager.js';
+import { DEFAULT_COMMAND_TIMEOUT, MAX_PROCESS_WAIT_MS } from './config.js';
+import { configManager, type ServerConfig } from './config-manager.js';
 import {capture} from "./utils/capture.js";
-import { analyzeProcessState } from './utils/process-detection.js';
+import { analyzeProcessState, STATE_DETECTION_TAIL_CHARS, type ProcessState } from './utils/process-detection.js';
+import { getDefaultShell, getShellSpawnArgs, type ShellSpawnConfig } from './utils/shell.js';
+import { terminateProcessTree } from './utils/process-tree.js';
 import { markHotPathEnter, markHotPathExit } from './utils/main-thread-watchdog.js';
 import { ShellByteDecoder, extractClixmlRecords } from './utils/clixml.js';
 
@@ -37,123 +38,6 @@ function getRepairedPathExt(): string {
   return current;
 }
 
-interface CompletedSession {
-  pid: number;
-  outputLines: string[];       // Line-based buffer (consistent with active sessions)
-  exitCode: number | null;
-  startTime: Date;
-  endTime: Date;
-  evictedLines: number;        // Carried over from the active session (see TerminalSession)
-  evictedChars: number;
-}
-
-/**
- * Output buffering caps. Without a cap, a process emitting enough output makes
- * string concatenation throw "RangeError: Invalid string length" at V8's max
- * string size (~536M chars) inside a stdout 'data' handler — an uncaught
- * exception that kills the whole server (index.ts exits on uncaughtException).
- * The cap also bounds the join() cost in snapshot reads and the periodic
- * process-state scan, both of which are O(total output).
- */
-export const MAX_BUFFERED_OUTPUT_CHARS = 50 * 1024 * 1024;  // per session; oldest lines evicted first
-const MAX_LINE_CHARS = 1024 * 1024;                  // force-split longer lines so eviction can work
-const MAX_WAIT_OUTPUT_CHARS = 2 * 1024 * 1024;       // start_process wait buffer (prompt/state detection)
-
-// Result type for paginated output reading
-export interface PaginatedOutputResult {
-  lines: string[];
-  totalLines: number;
-  readFrom: number;            // Starting line of this read
-  readCount: number;           // Number of lines returned
-  remaining: number;           // Lines remaining after this read
-  isComplete: boolean;         // Whether process has finished
-  exitCode?: number | null;    // Exit code if completed
-  runtimeMs?: number;          // Runtime in milliseconds (for completed processes)
-  evictedLines?: number;       // Lines dropped by the buffer cap; when > 0, line numbers are relative to the retained buffer
-}
-
-/**
- * Encode a command string for PowerShell's -EncodedCommand parameter.
- *
- * PowerShell's -Command parses the command through its tokenizer before
- * execution: variables ($_, $env:*, $PROFILE), back-ticks, and embedded quotes
- * all go through interpretation, which corrupts commands carrying any of those
- * characters before they ever reach the script body. -EncodedCommand bypasses
- * the tokenizer entirely: PS decodes the base64 UTF-16LE blob and runs the
- * literal string. Fixes upstream issue #350 (and the broken reproduction in
- * E:\MCP\DesktopCommanderMCP\bug.md, where Where-Object {$_.Name ...} was
- * stripped to {.Name ...}).
- *
- * Safe for any command: ASCII, CJK, mixed line endings, embedded quotes.
- */
-function encodePowerShellCommand(command: string): string {
-  return Buffer.from(command, 'utf16le').toString('base64');
-}
-
-/**
- * UTF-8 prefix injected before user PowerShell commands when
- * `disableShellEncodingPatching` is false (default).
- *
- * Why: Windows PowerShell 5.1's [Console]::OutputEncoding defaults to the OEM
- * code page (936/950/...) — child stdout emits non-UTF-8 bytes that Node
- * decodes as UTF-8 → mojibake (claude-code #7332, #46486, #9723). pwsh 7+
- * defaults to UTF-8 but inheriting it from a redirected-stdin spawn isn't
- * reliable. Inject the trio explicitly per-call so the result is independent
- * of the user's PS profile and version.
- *
- * `$ProgressPreference='SilentlyContinue'` suppresses progress records, which
- * PS 5.1 emits on stderr as CLIXML even with `-OutputFormat Text` set. Without
- * this, every PS call dumps ~1KB of `<Obj S="progress">` XML noise that AI
- * agents have no use for.
- */
-const POWERSHELL_UTF8_PREFIX =
-  '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;' +
-  '$OutputEncoding=[System.Text.Encoding]::UTF8;' +
-  '[Console]::InputEncoding=[System.Text.Encoding]::UTF8;' +
-  "$ProgressPreference='SilentlyContinue';";
-
-/**
- * Re-export the child's real exit status as PowerShell's own.
- *
- * PowerShell reports its *script's* success, not the exit code of the program
- * it ran: `node -e "process.exit(7)"` surfaces as 1. Every distinct failure
- * (127 command-not-found, 2 usage error, 130 SIGINT) collapses into the same
- * uninformative 1, so a caller — human or agent — has to guess why a command
- * failed and often just retries blindly.
- *
- * `$?` must be captured first: reading it is itself a statement, so consulting
- * $LASTEXITCODE beforehand would clobber it.
- *
- * ORDER MATTERS, and the intuitive order is wrong. $LASTEXITCODE is STICKY:
- * only a native executable ever writes it, and nothing clears it afterwards.
- * A failing cmdlet flips $? to False but leaves $LASTEXITCODE holding whatever
- * the last native command left behind — so `node -e "process.exit(0)"; Get-Item
- * <missing>` checked $LASTEXITCODE first, found a stale 0, and reported SUCCESS
- * for a command that failed. Combined with the CLIXML error text being dropped,
- * that produced the worst possible signal: no output, exit code 0, command
- * failed. So $? — which always reflects the LAST statement — is authoritative
- * for failure, and $LASTEXITCODE only supplies the specific code.
- *
- * The remaining case is a native program that exits non-zero: it sets both, and
- * $LASTEXITCODE gives the precise code (7, 127, 2) instead of a flat 1.
- *
- * Interactive sessions (python -i, node REPL) never reach this tail: those
- * commands don't return until the session is terminated.
- */
-const POWERSHELL_EXIT_CODE_SUFFIX =
-  ';$__dcOk=$?;' +
-  'if (-not $__dcOk) { if ($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 } }' +
-  'elseif ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }' +
-  'else { exit 0 }';
-
-// NOTE on cmd.exe and CJK: cmd parses its command line using the OEM code
-// page (936/950/...) at spawn time — `chcp 65001` only affects subsequent
-// OUTPUT, not the parsing of the literal arguments cmd already received.
-// Injecting `chcp 65001` therefore makes things WORSE (OEM-encoded literals
-// then get reinterpreted as UTF-8 on output → mojibake). cmd CJK output is
-// fundamentally unreliable from a child process; AI agents that need CJK
-// output should use `pwsh` or `powershell` instead.
-
 /**
  * Recover real text from PowerShell CLIXML envelopes and drop only the noise.
  *
@@ -181,116 +65,120 @@ function stripPsCliXml(text: string): string {
   return text
     .replace(/#< CLIXML\r?\n/g, '')
     .replace(/<Objs [\s\S]*?<\/Objs>/g, (block) => extractClixmlRecords(block))
+
     .replace(/^[\r\n]+/, '');
 }
 
+/** A child process's output pipes. */
+type OutputStream = 'stdout' | 'stderr';
+const OUTPUT_STREAMS: readonly OutputStream[] = ['stdout', 'stderr'];
+
+/** The end of one output pipe, kept for process-state detection (see getProcessState). */
+interface StreamTail {
+  text: string;    // Its last STATE_DETECTION_TAIL_CHARS chars
+  chars: number;   // Chars it has delivered since process start
+  turn: number;    // Event-loop turn that delivered its latest chunk (see currentDeliveryTurn)
+}
+type StreamTails = Record<OutputStream, StreamTail>;
+
+function newStreamTails(): StreamTails {
+  return { stdout: { text: '', chars: 0, turn: 0 }, stderr: { text: '', chars: 0, turn: 0 } };
+}
+
+/** An active session plus the per-stream tails that state detection reads. */
+interface ManagedSession extends TerminalSession {
+  streams: StreamTails;
+  termination?: Promise<boolean>;  // The forceTerminate in progress (or done); calls meanwhile await it, a failed one is dropped
+}
+
+/** Outcome of forceTerminate */
+export type TerminateOutcome = 'terminated' | 'failed' | 'not_found';
+
+interface CompletedSession {
+  // The session itself, not a copy: a process the command started can keep
+  // writing to the pipes after the exit, and that output lands in its buffers
+  session: ManagedSession;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;  // The signal that ended it; then exitCode is null
+  endTime: Date;
+}
+
+/** The retained-output fields shared by active and completed sessions. */
+type OutputBuffer = Pick<ManagedSession, 'outputLines' | 'bufferedChars' | 'evictedLines' | 'evictedChars' | 'streams'>;
+
 /**
- * Configuration for spawning a shell with appropriate flags
+ * A position in a session's output, absolute since process start (evicted
+ * output included), so it stays valid while the buffer cap evicts lines.
  */
-interface ShellSpawnConfig {
-  executable: string;
-  args: string[];
-  useShellOption: string | boolean;
-  // When true, pass args verbatim on Windows (see executeCommand). Only cmd.exe
-  // needs this; its quote parsing conflicts with libuv's default \" escaping.
-  windowsVerbatim?: boolean;
-  // When true, strip PowerShell CLIXML noise from output before returning.
-  // Set on pwsh/powershell branches when patchEncoding is on.
-  stripCliXml?: boolean;
+export interface OutputSnapshot {
+  totalChars: number;
+  lineCount: number;
+  streamChars: Record<OutputStream, number>;  // Chars each stream had delivered, for getProcessState
 }
 
 /**
- * Get the appropriate spawn configuration for a given shell
- * This handles login shell flags for different shell types.
- *
- * `patchEncoding` controls UTF-8 prefix injection (default true). On Windows
- * PowerShell 5.1 / cmd, child stdout emits non-UTF-8 bytes by default, which
- * Node decodes as UTF-8 → mojibake for any non-ASCII output. The prefix
- * switches the child's encoding to UTF-8 for the duration of that one
- * subprocess only. Set `disableShellEncodingPatching` config to opt out.
- *
- * For PowerShell, also injects -OutputFormat Text to suppress CLIXML
- * serialization on redirected stdout (Microsoft's PS-to-PS XML wire format
- * that AI agents have no use for and just adds 1-2KB of XML noise per call).
+ * Ceiling for a single blocking process wait (start_process's initial wait,
+ * interact_with_process, read_process_output). The wait is otherwise bounded
+ * only by the caller's timeout_ms, and MCP clients abandon a tool call after
+ * ~4 minutes (Claude Desktop: "No result received ... after 4 minutes"), so a
+ * large timeout_ms on a long, prompt-less command used to outlive the client.
+ * The ceiling is MAX_PROCESS_WAIT_MS; callers other than the tools (tests) may
+ * pass a smaller one.
  */
-function getShellSpawnArgs(shellPath: string, command: string, patchEncoding: boolean = true): ShellSpawnConfig {
-  const shellName = path.basename(shellPath).toLowerCase();
 
-  // Unix shells with login flag support (default UTF-8 — no prefix needed)
-  if (shellName.includes('bash') || shellName.includes('zsh')) {
-    return {
-      executable: shellPath,
-      args: ['-l', '-c', command],
-      useShellOption: false
-    };
-  }
+export interface ProcessWaitLimit {
+  waitMs: number;   // How long this call may block: min(timeout_ms, capMs)
+  capMs: number;    // Ceiling in effect (MAX_PROCESS_WAIT_MS unless a caller passed another)
+  capped: boolean;  // True when the ceiling, not timeout_ms, bounds this wait
+}
 
-  // PowerShell Core (cross-platform, supports -Login)
-  // Use -EncodedCommand instead of -Command to bypass PS's command-line
-  // tokenizer; otherwise variables ($_, $env:*), back-ticks, and embedded
-  // quotes get mangled before the script body runs (upstream #350, bug.md).
-  // -Login still applies — it controls profile loading, not the command source.
-  if (shellName === 'pwsh' || shellName === 'pwsh.exe') {
-    const wrappedCommand =
-      (patchEncoding ? POWERSHELL_UTF8_PREFIX + command : command) + POWERSHELL_EXIT_CODE_SUFFIX;
-    const args = ['-Login', '-NoLogo', '-NonInteractive'];
-    if (patchEncoding) args.push('-OutputFormat', 'Text');  // suppress CLIXML
-    args.push('-EncodedCommand', encodePowerShellCommand(wrappedCommand));
-    return {
-      executable: shellPath,
-      args,
-      useShellOption: false,
-      stripCliXml: patchEncoding
-    };
-  }
+/**
+ * The one place that turns a caller's timeout_ms into the time a process wait
+ * may actually block. When `capped`, the call returns at the ceiling with the
+ * process still running and the caller continues with read_process_output.
+ */
+export function getProcessWaitLimit(timeoutMs: number, capMs: number = MAX_PROCESS_WAIT_MS): ProcessWaitLimit {
+  return { waitMs: Math.min(timeoutMs, capMs), capMs, capped: timeoutMs > capMs };
+}
 
-  // Windows PowerShell 5.1 (no -Login support)
-  if (shellName === 'powershell' || shellName === 'powershell.exe') {
-    const wrappedCommand =
-      (patchEncoding ? POWERSHELL_UTF8_PREFIX + command : command) + POWERSHELL_EXIT_CODE_SUFFIX;
-    const args = ['-NoLogo', '-NonInteractive'];
-    if (patchEncoding) args.push('-OutputFormat', 'Text');  // suppress CLIXML
-    args.push('-EncodedCommand', encodePowerShellCommand(wrappedCommand));
-    return {
-      executable: shellPath,
-      args,
-      useShellOption: false,
-      stripCliXml: patchEncoding
-    };
-  }
+/** executeCommand result: CommandExecutionResult plus the process state and whether the wait ceiling ended the wait. */
+export interface ProcessStartResult extends CommandExecutionResult {
+  processState: ProcessState;  // State of the process when the wait ended (see getProcessState)
+  waitCappedAtMs?: number;     // Set when the wait stopped at the wait ceiling before timeout_ms; the process keeps running
+}
 
-  // CMD — encoding patching intentionally NOT applied (see CMD note above).
-  if (shellName === 'cmd' || shellName === 'cmd.exe') {
-    return {
-      executable: shellPath,
-      args: ['/c', command],
-      windowsVerbatim: true,
-      useShellOption: false
-    };
-  }
+/**
+ * Output buffering caps. Without a cap, a process emitting enough output makes
+ * string concatenation throw "RangeError: Invalid string length" at V8's max
+ * string size (~536M chars) inside a stdout 'data' handler — an uncaught
+ * exception that kills the whole server (index.ts exits on uncaughtException).
+ * The cap also bounds the cost of the reads that are O(total output), such as
+ * since-start snapshot reads.
+ */
+export const MAX_BUFFERED_OUTPUT_CHARS = 50 * 1024 * 1024;  // per session; oldest lines evicted first
+const MAX_LINE_CHARS = 1024 * 1024;                  // force-split longer lines so eviction can work
+const MAX_WAIT_OUTPUT_CHARS = 2 * 1024 * 1024;       // start_process wait buffer (the initial output it returns)
 
-  // Fish shell (uses -l for login, -c for command)
-  if (shellName.includes('fish')) {
-    return {
-      executable: shellPath,
-      args: ['-l', '-c', command],
-      useShellOption: false
-    };
-  }
-
-  // Unknown/other shells - use shell option for safety
-  // This provides a fallback for shells we don't explicitly handle
-  return {
-    executable: command,
-    args: [],
-    useShellOption: shellPath
-  };
+// Result type for paginated output reading
+export interface PaginatedOutputResult {
+  lines: string[];
+  totalLines: number;
+  readFrom: number;            // Starting line of this read
+  readCount: number;           // Number of lines returned
+  remaining: number;           // Lines remaining after this read
+  isComplete: boolean;         // Whether process has finished
+  exitCode?: number | null;    // Exit code if completed
+  signal?: NodeJS.Signals | null;  // Signal that ended it, if completed by one (exitCode is then null)
+  runtimeMs?: number;          // Runtime in milliseconds (for completed processes)
+  evictedLines?: number;       // Lines dropped by the buffer cap; when > 0, line numbers are relative to the retained buffer
 }
 
 export class TerminalManager {
-  private sessions: Map<number, TerminalSession> = new Map();
+  private sessions: Map<number, ManagedSession> = new Map();
   private completedSessions: Map<number, CompletedSession> = new Map();
-  
+  private deliveryTurn = 0;
+  private deliveryTurnOpen = false;
+
   /**
    * Send input to a running process
    * @param pid Process ID
@@ -305,7 +193,7 @@ export class TerminalManager {
     if (!session) {
       return false;
     }
-
+    
     try {
       if (session.process.stdin && !session.process.stdin.destroyed) {
         // Add a trailing newline only when the caller wants line-buffered
@@ -324,81 +212,50 @@ export class TerminalManager {
     }
   }
   
-  async executeCommand(command: string, timeoutMs: number = DEFAULT_COMMAND_TIMEOUT, shell?: string, collectTiming: boolean = false, cwd?: string, envOverrides?: Record<string, string>): Promise<CommandExecutionResult> {
-    // Read config once for shell + encoding-patching decisions. Failure falls
-    // back to safe defaults (default shell, encoding patching ON).
-    let configShell: string | undefined;
-    let patchEncoding = true;
+  async executeCommand(command: string, timeoutMs: number = DEFAULT_COMMAND_TIMEOUT, shell?: string, collectTiming: boolean = false, maxWaitMs: number = MAX_PROCESS_WAIT_MS, cwd?: string, envOverrides?: Record<string, string>): Promise<ProcessStartResult> {
+    let config: ServerConfig = {};
     try {
-      const config = await configManager.getConfig();
-      configShell = config.defaultShell;
-      patchEncoding = config.disableShellEncodingPatching !== true;
+      config = await configManager.getConfig();
     } catch (error) {
-      // Keep defaults
+      // If there's an error getting the config, fall back to the default shell
     }
-    let shellToUse: string | boolean | undefined = shell ?? configShell ?? true;
+    // Get the shell from config if not specified
+    const shellToUse = shell || config.defaultShell || getDefaultShell();
+    // UTF-8 prefix / -OutputFormat Text / CLIXML recovery for PowerShell (opt out via config)
+    const patchEncoding = config.disableShellEncodingPatching !== true;
+    const waitLimit = getProcessWaitLimit(timeoutMs, maxWaitMs);
 
     // For REPL interactions, we need to ensure stdin, stdout, and stderr are properly configured
     // Note: No special stdio options needed here, Node.js handles pipes by default
 
     // NOTE: We do NOT auto-inject `ssh -t` here. spawn child stdin is a pipe,
     // not a tty; forcing -t makes ssh print "Pseudo-terminal will not be
-    // allocated because stdin is not a terminal." on every call. ssh's
-    // default behavior (no -t) already does the right thing — allocates a
-    // pty when stdin is a tty, skips when piped. Users who actually need a
-    // remote pty can pass `-tt` explicitly. (Removed the legacy auto-`-t`
-    // enhancement after observing it was only ever producing stderr noise.)
-    let enhancedCommand = command;
+    // allocated because stdin is not a terminal." on every call. Users who
+    // actually need a remote pty can pass `-tt` explicitly.
+    const enhancedCommand = command;
 
-    // Get the appropriate spawn configuration for the shell
-    let spawnConfig: ShellSpawnConfig;
-    let spawnOptions: any;
-    
-    if (typeof shellToUse === 'string') {
-      // Use shell-specific configuration with login flags where appropriate
-      spawnConfig = getShellSpawnArgs(shellToUse, enhancedCommand, patchEncoding);
-      spawnOptions = {
-        env: {
-          ...process.env,
-          TERM: 'xterm-256color'  // Better terminal compatibility
-        },
-        windowsHide: true  // Prevent visible console windows on Windows
-      };
+    // Get the appropriate spawn configuration for the shell, with login flags where appropriate
+    const spawnConfig: ShellSpawnConfig = getShellSpawnArgs(shellToUse, enhancedCommand, patchEncoding);
+    const spawnOptions: any = {
+      env: {
+        ...process.env,
+        TERM: 'xterm-256color'  // Better terminal compatibility
+      },
+      windowsHide: true  // Prevent visible console windows on Windows
+    };
 
-      // Add shell option if needed (for unknown shells)
-      if (spawnConfig.useShellOption) {
-        spawnOptions.shell = spawnConfig.useShellOption;
-      }
-    } else {
-      // Boolean or undefined shell - use default shell option behavior
-      spawnConfig = {
-        executable: enhancedCommand,
-        args: [],
-        useShellOption: shellToUse
-      };
-      spawnOptions = {
-        shell: shellToUse,
-        env: {
-          ...process.env,
-          TERM: 'xterm-256color'
-        },
-        windowsHide: true  // Prevent visible console windows on Windows
-      };
+    // Add shell option if needed (for unknown shells)
+    if (spawnConfig.useShellOption) {
+      spawnOptions.shell = spawnConfig.useShellOption;
     }
 
-    // Apply cwd if provided. Caller (startProcess) is responsible for
-    // expanding ~ and validating the directory exists; we just trust the
-    // resolved absolute path here. If cwd is undefined, spawn inherits the
-    // parent process cwd — preserves legacy behavior for callers that don't
-    // pass cwd.
+    // Apply cwd if provided. Caller (startProcess) expands ~ and validates the
+    // directory; undefined inherits the parent process cwd.
     if (cwd) {
       spawnOptions.cwd = cwd;
     }
 
-    // Apply per-call env overrides on top of inherited process.env. Cannot
-    // delete inherited vars (only set/override) — use setX in the command
-    // itself if you need to unset. Already-merged spawnOptions.env keeps
-    // TERM=xterm-256color from above; caller overrides win on conflict.
+    // Per-call env overrides on top of inherited process.env (set/override only).
     if (envOverrides && spawnOptions.env) {
       spawnOptions.env = { ...spawnOptions.env, ...envOverrides };
     }
@@ -426,26 +283,51 @@ export class TerminalManager {
     const childProcess = spawn(spawnConfig.executable, spawnConfig.args, spawnOptions);
     let output = '';
 
+    // spawn() reports failure asynchronously via an 'error' event; it does not
+    // throw. Node rethrows an 'error' that has no listener as an uncaught
+    // exception, and our process-level handler (src/index.ts) turns that into
+    // process.exit(1). So an unresolvable executable — e.g. shell: "/usr/bin/bash"
+    // on Windows — used to kill the entire MCP server one tick AFTER this
+    // function had already returned "Failed to get process ID", making the crash
+    // look unrelated to the command that caused it. Under `remote` the parent
+    // then kept accepting tool calls over a dead stdio pipe ("Not connected").
+    //
+    // Attach before any return path below, and keep it for the session lifetime
+    // so a later runtime error (EPIPE on a closed stdin, ...) can't crash us either.
+    let forwardProcessError: ((err: Error) => void) | null = null;
+    let pendingProcessError: Error | null = null;
+    childProcess.on('error', (err: Error) => {
+      if (forwardProcessError) {
+        forwardProcessError(err);
+      } else {
+        pendingProcessError = err;
+        console.error(`Process error for "${command}": ${err.message}`);
+      }
+    });
+
     // Ensure childProcess.pid is defined before proceeding
     if (!childProcess.pid) {
       // Return a consistent error object instead of throwing
+      const output = 'Error: Failed to get process ID. The command could not be executed.';
       return {
         pid: -1,  // Use -1 to indicate an error state
-        output: 'Error: Failed to get process ID. The command could not be executed.',
-        isBlocked: false
+        output,
+        isBlocked: false,
+        processState: analyzeProcessState(output)
       };
     }
 
-    const session: TerminalSession = {
+    const session: ManagedSession = {
       pid: childProcess.pid,
       process: childProcess,
       outputLines: [],           // Line-based buffer
       lastReadIndex: 0,          // Track where "new" output starts
-      isBlocked: false,
+      lastReadOpenLine: '',
       startTime: new Date(),
       bufferedChars: 0,
       evictedLines: 0,
       evictedChars: 0,
+      streams: newStreamTails(),
       stripCliXml: spawnConfig.stripCliXml === true,
       cliXmlCarry: ''
     };
@@ -462,35 +344,43 @@ export class TerminalManager {
     return new Promise((resolve) => {
       let resolved = false;
       let periodicCheck: NodeJS.Timeout | null = null;
+      let waitTimer: NodeJS.Timeout | null = null;
 
       // Decode stdout/stderr from BYTES rather than trusting data.toString()'s
       // implicit UTF-8. PowerShell's CLIXML envelope and cmd.exe's own messages
       // are emitted in the OEM code page (936/950/932/...) no matter what
-      // [Console]::OutputEncoding is set to — PS initializes its CLIXML writer
-      // before any injected prefix runs — so assuming UTF-8 turned every
+      // [Console]::OutputEncoding is set to, so assuming UTF-8 turned every
       // non-ASCII error message into mojibake. These decoders sniff per stream
       // (valid UTF-8 stays UTF-8) and hold incomplete multi-byte sequences that
       // land on a chunk boundary instead of corrupting the character.
       const stdoutDecoder = new ShellByteDecoder();
       const stderrDecoder = new ShellByteDecoder();
 
-      // Quick prompt patterns for immediate detection
-      const quickPromptPatterns = />>>\s*$|>\s*$|\$\s*$|#\s*$/;
+      // Whether the process waits for input, judged as the periodic check does:
+      // from the end of each output stream, not from the chunk that just came
+      // (a chunk can end in the middle of a line, e.g. right after "<div>").
+      const waitingForInput = () => this.getProcessState(childProcess.pid!)?.isWaitingForInput === true;
 
-      const resolveOnce = (result: CommandExecutionResult) => {
+      const resolveOnce = (waitResult: Omit<ProcessStartResult, 'processState'>) => {
         if (resolved) return;
         resolved = true;
         if (periodicCheck) clearInterval(periodicCheck);
+        if (waitTimer) clearTimeout(waitTimer);
 
-        // Strip PowerShell CLIXML wire-format noise from output before
-        // returning. Done here (not per chunk) because <Objs> blocks can span
-        // multiple stdout/stderr data events. The session ring buffer is left
-        // raw — if read_process_output is later used on this PID it gets the
-        // unfiltered stream (CLIXML is mostly a startup artifact and rarely
-        // matters past the initial output).
-        if (spawnConfig.stripCliXml && result.output) {
-          result.output = stripPsCliXml(result.output);
+        // Recover PowerShell CLIXML record text (errors, warnings) and drop the
+        // progress noise in the wait-phase output. Done on the whole text, not
+        // per chunk, because <Objs> blocks can span several data events.
+        if (spawnConfig.stripCliXml && waitResult.output) {
+          waitResult = { ...waitResult, output: stripPsCliXml(waitResult.output) };
         }
+
+        // The state the wait ended in, from the session: finished if the
+        // process exited, else judged from its output. A process error after
+        // the exit leaves no session behind, so the text it returns is judged.
+        const result: ProcessStartResult = {
+          ...waitResult,
+          processState: this.getProcessState(childProcess.pid!) ?? analyzeProcessState(waitResult.output)
+        };
 
         // Add timing info if requested
         if (collectTiming) {
@@ -510,6 +400,28 @@ export class TerminalManager {
         resolve(result);
       };
 
+      // Now that resolveOnce exists, route process errors into it, so the caller
+      // doesn't sit waiting for output. The session goes only if the process
+      // has exited: Node also emits 'error' when a kill fails or a message can't
+      // be sent, and the process runs on. It then stays listed, readable and
+      // terminable, and its 'exit' records the completion as usual.
+      forwardProcessError = (err: Error) => {
+        if (childProcess.exitCode !== null || childProcess.signalCode !== null) {
+          this.sessions.delete(childProcess.pid!);
+        }
+        exitReason = 'process_exit';
+        resolveOnce({
+          pid: childProcess.pid!,
+          output: output + `\nProcess error: ${err.message}`,
+          isBlocked: false
+        });
+      };
+      // An error emitted between spawn and here (the common case — spawn errors
+      // land on the next tick) is replayed rather than dropped.
+      if (pendingProcessError) {
+        forwardProcessError(pendingProcessError);
+      }
+
       childProcess.stdout.on('data', (data: any) => {
         const text = stdoutDecoder.write(Buffer.isBuffer(data) ? data : Buffer.from(data));
         if (!text) return;
@@ -518,16 +430,16 @@ export class TerminalManager {
         if (!firstOutputTime) firstOutputTime = now;
         lastOutputTime = now;
 
-        // `output` only feeds the wait-phase result and prompt/state detection,
-        // so stop growing it once resolved and keep only a bounded tail.
+        // `output` only feeds the wait-phase result, so stop growing it once
+        // resolved and keep only a bounded tail.
         if (!resolved) {
           output += text;
           if (output.length > MAX_WAIT_OUTPUT_CHARS) {
             output = output.slice(-Math.floor(MAX_WAIT_OUTPUT_CHARS / 2));
           }
         }
-        // Append to line-based buffer (CLIXML-filtered at the boundary for PS)
-        this.appendToLineBuffer(session, this.filterCliXmlStream(session, text));
+        // The session buffer is CLIXML-filtered at the boundary for PowerShell
+        this.recordOutput(session, 'stdout', this.filterCliXmlStream(session, text));
 
         // Record output event if collecting timing
         if (collectTiming) {
@@ -540,9 +452,8 @@ export class TerminalManager {
           });
         }
 
-        // Immediate check for obvious prompts
-        if (quickPromptPatterns.test(text)) {
-          session.isBlocked = true;
+        // Immediate check for a prompt
+        if (waitingForInput()) {
           exitReason = 'early_exit_quick_pattern';
 
           if (collectTiming && outputEvents.length > 0) {
@@ -571,8 +482,8 @@ export class TerminalManager {
             output = output.slice(-Math.floor(MAX_WAIT_OUTPUT_CHARS / 2));
           }
         }
-        // Append to line-based buffer (CLIXML-filtered at the boundary for PS)
-        this.appendToLineBuffer(session, this.filterCliXmlStream(session, text));
+        // The session buffer is CLIXML-filtered at the boundary for PowerShell
+        this.recordOutput(session, 'stderr', this.filterCliXmlStream(session, text));
 
         // Record output event if collecting timing
         if (collectTiming) {
@@ -588,58 +499,48 @@ export class TerminalManager {
 
       // Periodic comprehensive check every 100ms
       periodicCheck = setInterval(() => {
-        if (output.trim()) {
-          const processState = analyzeProcessState(output, childProcess.pid);
-          if (processState.isWaitingForInput) {
-            session.isBlocked = true;
-            exitReason = 'early_exit_periodic_check';
-            resolveOnce({
-              pid: childProcess.pid!,
-              output,
-              isBlocked: true
-            });
-          }
+        if (waitingForInput()) {
+          exitReason = 'early_exit_periodic_check';
+          resolveOnce({
+            pid: childProcess.pid!,
+            output,
+            isBlocked: true
+          });
         }
       }, 100);
 
-      // Timeout fallback
-      setTimeout(() => {
-        session.isBlocked = true;
+      // Timeout fallback, bounded by the wait ceiling so the call returns
+      // before the MCP client gives up on it; the process keeps running.
+      waitTimer = setTimeout(() => {
         exitReason = 'timeout';
         resolveOnce({
           pid: childProcess.pid!,
           output,
-          isBlocked: true
+          isBlocked: true,
+          ...(waitLimit.capped && { waitCappedAtMs: waitLimit.capMs })
         });
-      }, timeoutMs);
+      }, waitLimit.waitMs);
 
-      childProcess.on('exit', (code: any) => {
+      childProcess.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
         if (childProcess.pid) {
-          // Flush any bytes held back mid-character by the byte decoders, then
-          // any carried-but-incomplete CLIXML fragment. Order matters: decoded
-          // bytes may complete the CLIXML construct the filter is holding.
-          const tailBytes = stdoutDecoder.flush() + stderrDecoder.flush();
-          if (tailBytes) {
-            this.appendToLineBuffer(session, this.filterCliXmlStream(session, tailBytes));
-          }
-          // Flush any carried-but-incomplete CLIXML fragment. Run it through
-          // the block stripper once more (recovers real text that was carried
-          // on a false positive); genuine dangling noise is near-impossible
-          // since CLIXML envelopes are well-formed and contiguous.
+          // Flush bytes the decoders held back mid-character, then any
+          // carried-but-incomplete CLIXML fragment (decoded bytes may complete
+          // the construct the filter is holding).
+          const stdoutTail = stdoutDecoder.flush();
+          if (stdoutTail) this.recordOutput(session, 'stdout', this.filterCliXmlStream(session, stdoutTail));
+          const stderrTail = stderrDecoder.flush();
+          if (stderrTail) this.recordOutput(session, 'stderr', this.filterCliXmlStream(session, stderrTail));
           if (session.cliXmlCarry) {
             const leftover = stripPsCliXml(session.cliXmlCarry);
             session.cliXmlCarry = '';
-            if (leftover) this.appendToLineBuffer(session, leftover);
+            if (leftover) this.recordOutput(session, 'stderr', leftover);
           }
           // Store completed session before removing active session
           this.completedSessions.set(childProcess.pid, {
-            pid: childProcess.pid,
-            outputLines: [...session.outputLines], // Copy line buffer
+            session,
             exitCode: code,
-            startTime: session.startTime,
-            endTime: new Date(),
-            evictedLines: session.evictedLines,
-            evictedChars: session.evictedChars
+            signal,
+            endTime: new Date()
           });
 
           // Keep only last 100 completed sessions
@@ -658,6 +559,37 @@ export class TerminalManager {
         });
       });
     });
+  }
+
+  /**
+   * Add a chunk of one stream's output to the session: to the merged line
+   * buffer, and to that stream's tail for state detection.
+   */
+  private recordOutput(session: ManagedSession, stream: OutputStream, text: string): void {
+    this.appendToLineBuffer(session, text);
+    const tail = session.streams[stream];
+    tail.text = (text.length >= STATE_DETECTION_TAIL_CHARS ? text : tail.text + text).slice(-STATE_DETECTION_TAIL_CHARS);
+    tail.chars += text.length;
+    tail.turn = this.currentDeliveryTurn();
+  }
+
+  /**
+   * Number of the event-loop turn now delivering output; every chunk
+   * dispatched before the next check phase (setImmediate) shares it.
+   *
+   * stdout and stderr are separate pipes. Each turn delivers what the OS had
+   * ready when the loop polled, so a chunk delivered in a later turn was
+   * written after the chunks of earlier turns. Within one turn the pipes come
+   * in either order: when python -i's final stdout newline and its stderr
+   * ">>> " prompt are both waiting, the prompt is often delivered first.
+   */
+  private currentDeliveryTurn(): number {
+    if (!this.deliveryTurnOpen) {
+      this.deliveryTurnOpen = true;
+      this.deliveryTurn++;
+      setImmediate(() => { this.deliveryTurnOpen = false; });
+    }
+    return this.deliveryTurn;
   }
 
   /**
@@ -758,7 +690,6 @@ export class TerminalManager {
   }
 
   private appendToLineBufferImpl(session: TerminalSession, text: string): void {
-    if (!text) return;
 
     // Split text into lines, keeping track of whether text ends with newline
     const lines = text.split('\n');
@@ -798,30 +729,20 @@ export class TerminalManager {
     // Enforce the per-session cap by evicting the oldest lines. Keeps the
     // buffer far below V8's max string length so concatenation and join()
     // can never throw "Invalid string length" and kill the server.
-    //
-    // PERF: compute how many oldest lines to drop, then remove them in a SINGLE
-    // splice. The previous implementation called Array.shift() once per evicted
-    // line — shift() is O(n) (re-indexes the whole array), so evicting K lines
-    // from an N-line buffer was O(N*K). On verbose output (typecheck/eslint/
-    // trial harnesses emitting hundreds of thousands of short lines near the
-    // 50MB cap) every incoming chunk re-triggered thousands of O(N) shifts,
-    // pegging the main thread for seconds and freezing the whole MCP server
-    // (confirmed by the stall watchdog pointing here). One splice is O(N) total.
-    if (session.bufferedChars > MAX_BUFFERED_OUTPUT_CHARS && session.outputLines.length > 1) {
-      const maxDrop = session.outputLines.length - 1; // always keep >= 1 line
-      let dropCount = 0;
-      let freed = 0;
-      while (dropCount < maxDrop && (session.bufferedChars - freed) > MAX_BUFFERED_OUTPUT_CHARS) {
-        freed += session.outputLines[dropCount].length + 1; // +1 for join separator
-        dropCount++;
-      }
-      if (dropCount > 0) {
-        session.outputLines.splice(0, dropCount);
-        session.bufferedChars -= freed;
-        session.evictedChars += freed;
-        session.evictedLines += dropCount;
-        session.lastReadIndex = Math.max(0, session.lastReadIndex - dropCount);
-      }
+    // Count them first and drop them with one splice: on an array this large
+    // every shift() copies the whole array, and a line-by-line shift() stalled
+    // the event loop for seconds per chunk once a session reached the cap.
+    let evicted = 0;
+    while (session.bufferedChars > MAX_BUFFERED_OUTPUT_CHARS && evicted < session.outputLines.length - 1) {
+      const droppedJoinedChars = session.outputLines[evicted].length + 1; // +1 for its join separator
+      session.bufferedChars -= droppedJoinedChars;
+      session.evictedChars += droppedJoinedChars;
+      evicted++;
+    }
+    if (evicted > 0) {
+      session.outputLines.splice(0, evicted);
+      session.evictedLines += evicted;
+      session.lastReadIndex = Math.max(0, session.lastReadIndex - evicted);
     }
   }
 
@@ -836,34 +757,26 @@ export class TerminalManager {
     // First check active sessions
     const session = this.sessions.get(pid);
     if (session) {
-      const result = this.readFromLineBuffer(
-        session.outputLines,
-        offset,
-        length,
-        session.lastReadIndex,
-        (newIndex) => { session.lastReadIndex = newIndex; },
-        false,
-        undefined
-      );
+      const result = this.readFromLineBuffer(session, offset, length, false, undefined);
       result.evictedLines = session.evictedLines;
       return result;
     }
 
-    // Then check completed sessions
+    // Then check completed sessions: they keep their read position, so
+    // reading on after the exit continues where the last read stopped
     const completedSession = this.completedSessions.get(pid);
     if (completedSession) {
-      const runtimeMs = completedSession.endTime.getTime() - completedSession.startTime.getTime();
+      const runtimeMs = completedSession.endTime.getTime() - completedSession.session.startTime.getTime();
       const result = this.readFromLineBuffer(
-        completedSession.outputLines,
+        completedSession.session,
         offset,
         length,
-        0,  // Completed sessions don't track read position
-        () => {},  // No-op for completed sessions
         true,
         completedSession.exitCode,
         runtimeMs
       );
-      result.evictedLines = completedSession.evictedLines;
+      result.evictedLines = completedSession.session.evictedLines;
+      result.signal = completedSession.signal;
       return result;
     }
 
@@ -871,54 +784,84 @@ export class TerminalManager {
   }
 
   /**
-   * Internal helper to read from a line buffer with offset/length
+   * Whether a default read (offset 0) has anything to return: complete lines
+   * past the read position, or an unfinished last line with text a read
+   * hasn't returned (see readFromLineBuffer). Line counts alone can't tell
+   * the second: text appended to that line adds no line.
+   */
+  hasUnreadOutput(pid: number): boolean {
+    const session = this.sessions.get(pid) ?? this.completedSessions.get(pid)?.session;
+    if (!session) {
+      return false;
+    }
+    return session.outputLines.length - 1 > session.lastReadIndex || TerminalManager.openLineHasNewText(session);
+  }
+
+  /**
+   * Whether the unfinished last line has text that a default read hasn't
+   * returned. Empty, it has nothing to return. Its text is compared with what
+   * a read last returned only while it is the line that read stopped at: a
+   * later line is new even when its text is the same (a REPL's next ">>> ").
+   */
+  private static openLineHasNewText(session: TerminalSession): boolean {
+    const lines = session.outputLines;
+    const openLine = lines[lines.length - 1] ?? '';
+    return openLine !== '' && (lines.length - 1 !== session.lastReadIndex || openLine !== session.lastReadOpenLine);
+  }
+
+  /**
+   * Internal helper to read from a session's line buffer with offset/length
    */
   private readFromLineBuffer(
-    lines: string[],
+    session: TerminalSession,
     offset: number,
     length: number,
-    lastReadIndex: number,
-    updateLastRead: (index: number) => void,
     isComplete: boolean,
     exitCode?: number | null,
     runtimeMs?: number
   ): PaginatedOutputResult {
-    const totalLines = lines.length;
+    const lines = session.outputLines;
+    // The empty last line after a trailing newline holds nothing: it isn't
+    // counted (total, remaining, tail offsets) or returned. A last line with
+    // text, unfinished or not, is.
+    const totalLines = lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
     let startIndex: number;
     let linesToRead: string[];
+    let readableEnd = totalLines;
 
     if (offset < 0) {
       // Negative offset = start position from end, then read 'length' lines forward
       // e.g., offset=-50, length=10 means: start 50 lines from end, read 10 lines
-      //
-      // Ignore a single trailing empty element when computing the tail anchor.
-      // appendToLineBuffer splits on '\n', so output ending in a newline always
-      // leaves a final '' element (the not-yet-written current line). Without
-      // this, offset=-1 returns that empty string → "(No output in requested
-      // range)" even though real lines exist — the #1 reason live-tail and
-      // post-finish tail reads came back blank (reported P1/P6, offset=-1).
-      let effEnd = totalLines;
-      if (effEnd > 0 && lines[effEnd - 1] === '') effEnd--;
       const fromEnd = Math.abs(offset);
-      startIndex = Math.max(0, effEnd - fromEnd);
-      linesToRead = lines.slice(startIndex, startIndex + length);
+      startIndex = Math.max(0, totalLines - fromEnd);
+      linesToRead = lines.slice(startIndex, Math.min(startIndex + length, totalLines));
       // Don't update lastReadIndex for tail reads
     } else if (offset === 0) {
-      // offset=0 means "from where I last read" (like getNewOutput)
-      startIndex = lastReadIndex;
-      linesToRead = lines.slice(startIndex, startIndex + length);
-      // Update lastReadIndex for "new output" behavior
-      updateLastRead(Math.min(startIndex + linesToRead.length, totalLines));
+      // offset=0 means "from where I last read" (like getNewOutput).
+      // The last line is unfinished: output is appended to it until a newline
+      // arrives, even after the exit (a process the command started can still
+      // write). So it is returned only when it has text a read hasn't
+      // returned, and the read position never moves past it: counting it as
+      // read would lose whatever is appended to it next.
+      const openLineIndex = Math.max(lines.length - 1, 0);
+      readableEnd = TerminalManager.openLineHasNewText(session) ? lines.length : openLineIndex;
+      startIndex = session.lastReadIndex;
+      linesToRead = lines.slice(startIndex, Math.min(startIndex + length, readableEnd));
+      const readTo = startIndex + linesToRead.length;
+      if (readTo === lines.length) {
+        session.lastReadOpenLine = lines[lines.length - 1];
+      }
+      session.lastReadIndex = Math.min(readTo, openLineIndex);
     } else {
       // Positive offset = absolute position
       startIndex = offset;
-      linesToRead = lines.slice(startIndex, startIndex + length);
+      linesToRead = lines.slice(startIndex, Math.min(startIndex + length, totalLines));
       // Don't update lastReadIndex for absolute position reads
     }
 
     const readCount = linesToRead.length;
     const endIndex = startIndex + readCount;
-    const remaining = Math.max(0, totalLines - endIndex);
+    const remaining = Math.max(0, readableEnd - endIndex);
 
     return {
       lines: linesToRead,
@@ -943,7 +886,7 @@ export class TerminalManager {
 
     const completedSession = this.completedSessions.get(pid);
     if (completedSession) {
-      return completedSession.outputLines.length;
+      return completedSession.session.outputLines.length;
     }
 
     return null;
@@ -951,36 +894,13 @@ export class TerminalManager {
 
   /**
    * Total chars emitted by a process since start (evicted + retained),
-   * monotonically increasing. O(1) — reads the running counters, never joins.
-   *
-   * Why this exists (follow_ms responsiveness, see read_process_output): the
-   * tail-follow wait used to poll getOutputLineCount, which only increments on
-   * a COMPLETE new line. Processes that update in place (`\r` progress bars,
-   * spinners) or emit partial lines without a trailing newline never bumped
-   * the line count, so follow_ms sat idle until the next newline — appearing
-   * to "hang" even though bytes were arriving. Char count moves on ANY new
-   * output, so follow resolves promptly on partial-line activity too.
-   *
-   * NOTE: this does not and cannot fix child-side block buffering — a process
-   * whose libc fully buffers stdout/stderr to a pipe (no TTY) still flushes in
-   * bursts; that requires a PTY, which this transport does not allocate.
+   * monotonically increasing. O(1). Used by read_process_output's follow_ms:
+   * a line count only moves on a COMPLETE new line, so `\r` progress bars and
+   * partial lines never woke the follow; char count moves on any output.
    */
   getOutputCharCount(pid: number): number | null {
-    const session = this.sessions.get(pid);
-    if (session) {
-      return session.evictedChars + session.bufferedChars;
-    }
-
-    const completedSession = this.completedSessions.get(pid);
-    if (completedSession) {
-      // Completed sessions don't retain bufferedChars; approximate from the
-      // retained buffer length + evicted chars (sufficient for follow, which
-      // only targets active sessions anyway).
-      const joinedLen = completedSession.outputLines.join('\n').length;
-      return completedSession.evictedChars + joinedLen;
-    }
-
-    return null;
+    const buffer: OutputBuffer | undefined = this.sessions.get(pid) ?? this.completedSessions.get(pid)?.session;
+    return buffer ? buffer.evictedChars + buffer.bufferedChars : null;
   }
 
   /**
@@ -1019,19 +939,9 @@ export class TerminalManager {
    * Capture a snapshot of current output state for interaction tracking.
    * Used by interactWithProcess to know what output existed before sending input.
    */
-  captureOutputSnapshot(pid: number): { totalChars: number; lineCount: number } | null {
+  captureOutputSnapshot(pid: number): OutputSnapshot | null {
     const session = this.sessions.get(pid);
-    if (session) {
-      const fullOutput = session.outputLines.join('\n');
-      return {
-        // Absolute since process start (includes evicted output), so the
-        // offset stays valid even if the cap evicts lines between
-        // snapshot and read.
-        totalChars: session.evictedChars + fullOutput.length,
-        lineCount: session.evictedLines + session.outputLines.length
-      };
-    }
-    return null;
+    return session ? TerminalManager.endOfOutput(session) : null;
   }
 
   /**
@@ -1039,34 +949,105 @@ export class TerminalManager {
    * This handles the case where output is appended to the last line (REPL prompts).
    * Also checks completed sessions in case process finished between snapshot and poll.
    */
-  getOutputSinceSnapshot(pid: number, snapshot: { totalChars: number; lineCount: number }): string | null {
-    // Check active session first
-    const session = this.sessions.get(pid);
-    if (session) {
-      return TerminalManager.outputSinceSnapshot(session.outputLines, session.evictedChars, snapshot.totalChars);
-    }
-
-    // Fallback to completed sessions - process may have finished between snapshot and poll
-    const completedSession = this.completedSessions.get(pid);
-    if (completedSession) {
-      return TerminalManager.outputSinceSnapshot(completedSession.outputLines, completedSession.evictedChars, snapshot.totalChars);
-    }
-
-    return null;
+  getOutputSinceSnapshot(pid: number, snapshot: OutputSnapshot): string | null {
+    return this.readOutputSince(pid, snapshot)?.output ?? null;
   }
 
   /**
-   * New output since a snapshot, in absolute (since process start) offsets.
-   * If eviction dropped part of the unseen output, returns what the buffer
-   * still holds — the oldest unseen chars are lost to the cap.
+   * Output that appeared since `snapshot`, plus the snapshot at the current end
+   * of output. A poller passes `next` back in to read only the output that
+   * arrived since its previous poll. Costs O(output since snapshot), never
+   * O(whole buffer), so polling stays cheap however much history the session
+   * has retained. Also checks completed sessions in case the process finished
+   * between snapshot and poll.
    */
-  private static outputSinceSnapshot(outputLines: string[], evictedChars: number, snapshotTotalChars: number): string {
-    const fullOutput = outputLines.join('\n');
-    const newChars = evictedChars + fullOutput.length - snapshotTotalChars;
-    if (newChars <= 0) {
+  readOutputSince(pid: number, snapshot: OutputSnapshot): { output: string; next: OutputSnapshot } | null {
+    const buffer: OutputBuffer | undefined = this.sessions.get(pid) ?? this.completedSessions.get(pid)?.session;
+    if (!buffer) {
+      return null;
+    }
+    return {
+      output: TerminalManager.outputSinceSnapshot(buffer, snapshot.totalChars),
+      next: TerminalManager.endOfOutput(buffer)
+    };
+  }
+
+  /**
+   * Snapshot at the current end of a buffer, in O(1): bufferedChars is the
+   * joined length of the retained lines, so nothing is joined here.
+   */
+  private static endOfOutput(buffer: OutputBuffer): OutputSnapshot {
+    return {
+      // Absolute since process start (includes evicted output), so the
+      // offset stays valid even if the cap evicts lines between
+      // snapshot and read.
+      totalChars: buffer.evictedChars + buffer.bufferedChars,
+      lineCount: buffer.evictedLines + buffer.outputLines.length,
+      streamChars: { stdout: buffer.streams.stdout.chars, stderr: buffer.streams.stderr.chars }
+    };
+  }
+
+  /**
+   * The process's state: finished once it has exited, whatever its output
+   * says; otherwise waiting for input or running, judged from the end of the
+   * output it wrote since `since` (default: since it started). Reads only the
+   * per-stream tails, so it costs the same however much output the process
+   * has produced. The one place start_process, interact_with_process,
+   * read_process_output and list_sessions get the state from.
+   */
+  getProcessState(pid: number, since?: OutputSnapshot): ProcessState | null {
+    const session = this.sessions.get(pid);
+    if (session) {
+      return analyzeProcessState(TerminalManager.lastWrittenOutput(session.streams, since), pid);
+    }
+    const completedSession = this.completedSessions.get(pid);
+    if (!completedSession) {
+      return null;
+    }
+    const lastOutput = TerminalManager.lastWrittenOutput(completedSession.session.streams, since).join('\n');
+    return { isWaitingForInput: false, isFinished: true, isRunning: false, lastOutput };
+  }
+
+  /**
+   * The output since `since` of each stream that may have written last: the
+   * streams delivered in the latest turn that delivered anything since then.
+   * Their relative order within that turn is unknown (see
+   * currentDeliveryTurn), so each is judged on its own; streams last
+   * delivered in an earlier turn wrote before them and can't end the output.
+   */
+  private static lastWrittenOutput(streams: StreamTails, since?: OutputSnapshot): string[] {
+    const recent = OUTPUT_STREAMS
+      .map(name => {
+        const { text, chars, turn } = streams[name];
+        const newChars = chars - (since?.streamChars[name] ?? 0);
+        return { text: newChars > 0 ? text.slice(-newChars) : '', turn };
+      })
+      .filter(stream => stream.text.length > 0);
+    const lastTurn = Math.max(...recent.map(stream => stream.turn));
+    return recent.filter(stream => stream.turn === lastTurn).map(stream => stream.text);
+  }
+
+  /**
+   * New output since a snapshot, in absolute (since process start) offsets:
+   * the last (end - snapshot) chars of the joined buffer. Walks back from the
+   * newest line only until the snapshot position is covered and joins just
+   * those lines. If eviction dropped part of the unseen output, returns what
+   * the buffer still holds — the oldest unseen chars are lost to the cap.
+   */
+  private static outputSinceSnapshot(buffer: OutputBuffer, snapshotTotalChars: number): string {
+    const { outputLines } = buffer;
+    const newChars = buffer.evictedChars + buffer.bufferedChars - snapshotTotalChars;
+    if (newChars <= 0 || outputLines.length === 0) {
       return ''; // No new output
     }
-    return fullOutput.substring(Math.max(0, fullOutput.length - newChars));
+    let firstLine = outputLines.length - 1;
+    let tailChars = outputLines[firstLine].length; // Joined length of outputLines[firstLine..]
+    while (tailChars < newChars && firstLine > 0) {
+      firstLine--;
+      tailChars += outputLines[firstLine].length + 1; // +1 for its join separator
+    }
+    const tail = outputLines.slice(firstLine).join('\n');
+    return tail.substring(Math.max(0, tail.length - newChars));
   }
 
     /**
@@ -1079,113 +1060,44 @@ export class TerminalManager {
   }
 
   /**
-   * Kill the whole descendant tree of a session's shell process.
-   *
-   * `ChildProcess.kill()` only signals the process we spawned — which is the
-   * shell wrapper (`powershell -EncodedCommand ...`, `cmd /c ...`, `bash -c
-   * ...`), not the command the caller actually ran. The real work (`uv run
-   * pytest`, `pnpm dev`, `tail -f`) is a grandchild, so killing the wrapper
-   * leaves it running, reparented and unreachable: on Windows nothing reaps
-   * orphans, so it survives until reboot.
-   *
-   * Windows has no signal semantics at all — `kill()` there is a hard
-   * TerminateProcess on that single pid — so `taskkill /T` is the only way to
-   * reach descendants, and it must carry `/F`: without it Windows merely posts
-   * a close request that a non-GUI process like PowerShell ignores (verified:
-   * `/T` alone left both wrapper and child alive, `/T /F` killed both).
-   *
-   * Ordering matters and is counter-intuitive. `/T` resolves the tree at call
-   * time, so it must run while the wrapper is still alive; killing the wrapper
-   * first (the "SIGINT then SIGKILL" shape that reads as gentler) destroys it
-   * immediately on Windows, orphaning the descendants before any sweep can
-   * find them. That is exactly the bug this method exists to fix, so on Windows
-   * we take the tree down in one shot and never pre-kill the wrapper.
-   *
-   * On POSIX we walk the tree with `pgrep -P` instead of killing a process
-   * group, because these shells are spawned without `detached: true` and
-   * therefore share the server's group; signalling the group would hit the MCP
-   * server itself.
-   *
-   * Best-effort by design: the sweep is fire-and-forget, and a pid that already
-   * exited (ESRCH / "not found") is a success, not an error.
+   * End a session: its shell and every process the command started (see
+   * terminateProcessTree). Killing only the shell left the program running.
+   * Resolves once they are gone: 'terminated', or 'failed' if some could not
+   * be ended; 'not_found' when no session runs as `pid`. Never rejects.
    */
-  private killProcessTree(pid: number, force: boolean): void {
-    if (process.platform === 'win32') {
-      // Always /F — see above, /T without /F is a no-op for console processes.
-      // Scoped to this pid's subtree — never `/IM`, which would match every
-      // process sharing the image name and take out unrelated MCP servers.
-      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], () => {});
-      return;
-    }
-
-    const signal = force ? 'SIGKILL' : 'SIGINT';
-    // -P is children-of-pid, so recurse to reach deeper descendants. Kill
-    // depth-first (children before the parent) so a supervisor like `uv` does
-    // not observe its child dying and restart it. The caller signals `pid`
-    // itself, so this only ever touches descendants.
-    execFile('pgrep', ['-P', String(pid)], (err, stdout) => {
-      if (err || !stdout) return;
-      for (const line of stdout.split('\n')) {
-        const childPid = Number.parseInt(line.trim(), 10);
-        if (!Number.isInteger(childPid) || childPid <= 0) continue;
-        this.killProcessTree(childPid, force);
-        try {
-          process.kill(childPid, signal);
-        } catch {
-          // Already gone (ESRCH) or not ours (EPERM) — nothing to do.
-        }
-      }
-    });
-  }
-
-  forceTerminate(pid: number): boolean {
+  async forceTerminate(pid: number): Promise<TerminateOutcome> {
     const session = this.sessions.get(pid);
     if (!session) {
-      return false;
+      return 'not_found';
     }
 
-    try {
-        if (process.platform === 'win32') {
-          // One shot, tree intact. Pre-killing the wrapper here would orphan
-          // the descendants before /T could resolve them (see killProcessTree).
-          // There is no gentler step to offer: Windows kill() is already a hard
-          // terminate, so a two-phase escalation buys nothing and costs the tree.
-          this.killProcessTree(pid, true);
-          return true;
-        }
-
-        // POSIX: SIGINT is a real signal a shell can pass on, so keep the
-        // grace period. Descendants first, then the shell we own — reversed,
-        // a wrapper that restarts its child (uv, poetry, npm) could spawn a
-        // fresh one in the window between the two calls.
-        this.killProcessTree(pid, false);
-        session.process.kill('SIGINT');
-        setTimeout(() => {
-          if (this.sessions.has(pid)) {
-            this.killProcessTree(pid, true);
-            session.process.kill('SIGKILL');
-          }
-        }, 1000).unref?.();
-        return true;
-      } catch (error) {
-        // Convert error to string, handling both Error objects and other types
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        capture('server_request_error', {error: errorMessage, message: `Failed to terminate process ${pid}:`});
-        return false;
-      }
+    if (!session.termination) {
+      // Calls made while it runs share it; a failed one is dropped, so the next call tries again
+      session.termination = terminateProcessTree(session.process).then((ended) => {
+        if (!ended) session.termination = undefined;
+        return ended;
+      });
+    }
+    if (await session.termination) {
+      return 'terminated';
+    }
+    capture('server_request_error', {error: 'Process tree termination failed', message: `Failed to terminate process ${pid}:`});
+    return 'failed';
   }
 
   listActiveSessions(): ActiveSession[] {
     const now = new Date();
     return Array.from(this.sessions.values()).map(session => ({
       pid: session.pid,
-      isBlocked: session.isBlocked,
+      // Waiting for input now, judged from its output like every other state answer
+      isBlocked: this.getProcessState(session.pid)?.isWaitingForInput ?? false,
       runtime: now.getTime() - session.startTime.getTime()
     }));
   }
 
-  listCompletedSessions(): CompletedSession[] {
-    return Array.from(this.completedSessions.values());
+  listCompletedSessions(): Array<CompletedSession & { pid: number; outputLines: string[] }> {
+    // pid at the top level, as before the v0.3.0 session refactor (callers and tests look it up)
+    return Array.from(this.completedSessions.values()).map(completed => ({ ...completed, pid: completed.session.pid, outputLines: completed.session.outputLines }));
   }
 }
 

@@ -40,6 +40,7 @@ import { configManager } from '../config-manager.js';
 import { fuzzySearchLogger, type FuzzySearchLogEntry } from '../utils/fuzzySearchLogger.js';
 import { resolvePreviewFileType } from '../ui/file-preview/shared/preview-file-types.js';
 import { resolveAbsolutePath, groupKeyForPath } from '../handlers/filesystem-handlers.js';
+import type { EditResult } from '../utils/files/base.js';
 
 interface SearchReplace {
     search: string;
@@ -158,7 +159,8 @@ export function exactReplaceInContent(
     let pos = content.indexOf(normalizedSearch);
     while (pos !== -1) {
         count++;
-        pos = content.indexOf(normalizedSearch, pos + 1);
+        // Non-overlapping, as split/join replaces them (upstream expected_replacements semantics)
+        pos = content.indexOf(normalizedSearch, pos + normalizedSearch.length);
     }
 
     if (count > 0 && count === expectedReplacements) {
@@ -351,6 +353,19 @@ RECOMMENDATION: For large search/replace operations, consider breaking them into
         await fuzzySearchLogger.log(logEntry);
         
         // Combine all fuzzy search data for single capture
+        //
+        // character_codes (characterCodeData.report) is deliberately NOT sent.
+        // It is a frequency map of the characters in the diff between the
+        // search text and the file text, so for a short diff it is close to
+        // recoverable file content — and mcp-privacy-policy.md states that
+        // file contents are not collected. It was added as diagnostics for the
+        // CRLF/LF normalization work in #103 (May 2025) to show whether failed
+        // matches came from \r (13), \n (10) or non-breaking spaces; that
+        // question is long since answered.
+        //
+        // The scalars below are kept: they are counts and lengths, and carry
+        // no recoverable content. The full report still goes to the local
+        // fuzzy-search.log for anyone debugging on their own machine.
         const fuzzySearchData = {
             similarity: similarity,
             execution_time_ms: executionTime,
@@ -358,7 +373,6 @@ RECOMMENDATION: For large search/replace operations, consider breaking them into
             file_size: content.length,
             threshold: FUZZY_THRESHOLD,
             found_text_length: fuzzyResult.value.length,
-            character_codes: characterCodeData.report,
             unique_character_count: characterCodeData.uniqueCount,
             total_diff_length: characterCodeData.diffLength
         };
@@ -483,6 +497,11 @@ function highlightDifferences(expected: string, actual: string): string {
     return `${commonPrefix}{-${expectedDiff}-}{+${actualDiff}+}${commonSuffix}`;
 }
 
+/** Why a file handler's edit failed, as edit_block reports it */
+function editFailure(result: EditResult): string {
+    return result.errors?.map(e => e.error).join('; ') || 'Unknown error';
+}
+
 /**
  * Handle edit_block command
  *
@@ -542,22 +561,15 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
         if (hasEditRange) {
             try {
                 // parsed.range is guaranteed non-empty string by hasRange check above
-                const rangeResult = await handler.editRange!(validatedPath!, parsed.range!, content, parsed.options);
-
-                // Excel signals failure by throwing, but a handler may also report it in the
-                // result (markdown section mode returns success:false for a missing/ambiguous
-                // heading or a stale section hash). Ignoring that would report a refused edit
-                // as "Successfully updated" — the exact silent-success this mode exists to avoid.
-                if (rangeResult && rangeResult.success === false) {
-                    const why = rangeResult.errors?.map(e => e.error).join('; ') || 'edit was not applied';
-                    return createErrorResponse(why);
+                const result = await handler.editRange!(validatedPath!, parsed.range!, content, parsed.options);
+                if (!result.success) {
+                    return createErrorResponse(editFailure(result));
                 }
-
                 const resolvedRangePath = resolveAbsolutePath(parsed.file_path);
                 // Advisory notes (e.g. a name from the removed text still present elsewhere)
                 // ride along with the success message rather than in a separate channel — a
                 // warning the caller has to go looking for is one it will not read.
-                const noteText = rangeResult?.notes?.length ? `\n${rangeResult.notes.join('\n')}` : '';
+                const noteText = result.notes?.length ? `\n${result.notes.join('\n')}` : '';
                 return {
                     content: [{
                         type: "text",
@@ -622,8 +634,7 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
                 };
             }
 
-            const errorMsg = result.errors?.map(e => e.error).join('; ') || 'Unknown error';
-            return createErrorResponse(errorMsg);
+            return createErrorResponse(editFailure(result));
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
             return createErrorResponse(errorMessage);

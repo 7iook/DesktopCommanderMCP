@@ -12,9 +12,11 @@ import { runSetup } from './npm-scripts/setup.js';
 import { runUninstall } from './npm-scripts/uninstall.js';
 import { capture } from './utils/capture.js';
 import { logToStderr, logger } from './utils/logger.js';
+import { exitProcess } from './utils/exit-process.js';
 import { runRemote } from './npm-scripts/remote.js';
 import { ensureChromeAvailable } from './tools/pdf/markdown.js';
 import { startMainThreadWatchdog } from './utils/main-thread-watchdog.js';
+import { preloadFileSupport } from './utils/files/index.js';
 
 // Store messages to defer until after initialization
 const deferredMessages: Array<{ level: string, message: string }> = [];
@@ -93,17 +95,20 @@ async function runServer() {
       });
 
       logger.error(`Uncaught exception: ${errorMessage}`);
-      process.exit(1);
+      exitProcess(1);
     });
 
-    // Handle unhandled rejections
+    // Handle unhandled rejections: log and keep serving. The code that created
+    // the promise has already moved on (often a library's detached cleanup, as
+    // with puppeteer's profile removal), so the server's state is intact, and
+    // exiting would drop every running process, session and search.
     process.on('unhandledRejection', async (reason) => {
       const errorMessage = reason instanceof Error ? reason.message : String(reason);
 
-      // If this is a JSON parsing error, log it to stderr but don't crash
+      // A JSON parsing error is logged as before, and not sent to telemetry
       if (errorMessage.includes('JSON') && errorMessage.includes('Unexpected token')) {
         logger.error(`JSON parsing rejection: ${errorMessage}`);
-        return; // Don't exit on JSON parsing errors
+        return;
       }
 
       capture('run_server_unhandled_rejection', {
@@ -111,7 +116,6 @@ async function runServer() {
       });
 
       logger.error(`Unhandled rejection: ${errorMessage}`);
-      process.exit(1);
     });
 
     capture('run_server_start');
@@ -137,6 +141,10 @@ async function runServer() {
 
       // Preemptively check/download Chrome for PDF generation (runs in background)
       ensureChromeAvailable();
+
+      // Load the Excel, DOCX and PDF packages, one at a time, now that initialize
+      // has been answered; until then the calls that need them answer at once
+      preloadFileSupport();
     };
 
     await server.connect(transport);
@@ -162,7 +170,7 @@ async function runServer() {
     capture('run_server_failed_start_error', {
       error: errorMessage
     });
-    process.exit(1);
+    exitProcess(1);
   }
 }
 
@@ -180,5 +188,5 @@ runServer().catch(async (error) => {
   capture('run_server_fatal_error', {
     error: errorMessage
   });
-  process.exit(1);
+  exitProcess(1);
 });
