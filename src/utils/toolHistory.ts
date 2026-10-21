@@ -117,7 +117,7 @@ class ToolHistory {
       // for everyone it was written for.
       this.history = records
         .slice(-this.MAX_ENTRIES)
-        .map(record => ({ ...record, output: this.capOutput(record.output) }));
+        .map(record => this.toStoredRecord(record));
 
       // If file is getting too large, trim it
       if (lines.length > this.MAX_ENTRIES * 2) {
@@ -270,26 +270,34 @@ class ToolHistory {
     } as ServerResult;
   }
 
+  /**
+   * The record as history keeps it, for new calls and for records loaded from
+   * disk alike: output capped, and when the cap replaced it, what the anomaly
+   * rules found in the full output (the omission marker no longer carries it).
+   * Only oversized outputs pay for the rules here; the rest are judged on demand.
+   */
+  private toStoredRecord(record: ToolCallRecord): ToolCallRecord {
+    const output = this.capOutput(record.output);
+    if (output === record.output) return record;
+    const stored: ToolCallRecord = { ...record, output };
+    const marks = detectAnomalies(record).map(h => ({ ruleId: h.ruleId, context: h.context }));
+    if (marks.length > 0) stored.anomalyMarks = marks;
+    return stored;
+  }
+
   addCall(
     toolName: string,
     args: any,
     output: ServerResult,
     duration?: number
   ): void {
-    const stored = this.capOutput(output);
-    const record: ToolCallRecord = {
+    const record = this.toStoredRecord({
       timestamp: new Date().toISOString(),
       toolName,
       arguments: args,
-      output: stored,
+      output,
       duration
-    };
-    if (stored !== output) {
-      // Judge the full output now, while it still exists. Only oversized
-      // calls pay this; everything else is judged on demand as before.
-      const marks = detectAnomalies({ ...record, output }).map(h => ({ ruleId: h.ruleId, context: h.context }));
-      if (marks.length > 0) record.anomalyMarks = marks;
-    }
+    });
 
     this.history.push(record);
 

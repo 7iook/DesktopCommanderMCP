@@ -34,8 +34,24 @@ async function testCappedRecordKeepsItsAnomaly() {
     console.log('✓ a capped history record still reports the anomaly its full output showed');
 }
 
+/** A record written before the cap existed is capped on load: judge it before that too. */
+async function testLegacyDiskRecordKeepsItsAnomaly() {
+    const big = '✗ x.md — File already exists (9000 bytes); rewrite would overwrite it. Retry with ' +
+        "mode:'rewrite', allowOverwrite:true to replace it." + ' '.repeat(6000);
+    const legacy = { timestamp: new Date().toISOString(), toolName: 'write_multiple_files', arguments: {},
+        output: { content: [{ type: 'text', text: big }] } };
+    // The same step loadFromDisk applies to every record it reads
+    const loaded = toolHistory['toStoredRecord'](legacy);
+    assert.match(loaded.output.content[0].text, /output omitted from history/, 'the legacy record is capped on load');
+    const ids = detectAnomalies(loaded).map(h => h.ruleId);
+    assert.ok(ids.includes('write_file_overwrite_blocked'),
+        `a legacy record capped on load must keep its anomaly, got ${JSON.stringify(ids)}`);
+    console.log('✓ a legacy record capped on load keeps its anomaly');
+}
+
 export default async function runTests() {
     await testCappedRecordKeepsItsAnomaly();
+    await testLegacyDiskRecordKeepsItsAnomaly();
     return true;
 }
 

@@ -196,6 +196,39 @@ async function testLineByLineWaitsWithinTheCeiling() {
   console.log('ok: line-by-line waits end at the wait ceiling and say so');
 }
 
+async function testLineDelaysAndSettleWithinTheCeiling() {
+  console.log('\n--- Test 8: delay_after_ms and settle_ms stay within the ceiling and say so ---');
+  const CAP_MS = 120;
+  const started = await startProcess({ command: 'node -e "process.stdin.resume(); setTimeout(() => {}, 8000)"', timeout_ms: 500 });
+  const pid = started.structuredContent?.pid;
+  assert.ok(pid > 0, `start_process should start node, got: ${started.content[0].text}`);
+  try {
+    // A fixed delay the ceiling cut short did not finish: not a success
+    let t0 = Date.now();
+    let result = await interactWithProcessLines({ pid, lines: [{ input: 'a', delay_after_ms: 3000 }] }, CAP_MS);
+    let text = result.content[0].text;
+    assert.ok(Date.now() - t0 < 1000, `a 3 s delay ran past the ${CAP_MS}ms ceiling: ${text}`);
+    assert.strictEqual(result.isError, true, `a delay cut short must not report success: ${text}`);
+    assert.match(text, /wait ceiling/, `the answer should say the ceiling cut the delay short: ${text}`);
+
+    // The pause between lines is a wait too
+    t0 = Date.now();
+    result = await interactWithProcessLines({
+      pid, settle_ms: 1500, lines: [{ input: 'b', delay_after_ms: 0 }, { input: 'c', delay_after_ms: 0 }],
+    }, CAP_MS);
+    text = result.content[0].text;
+    assert.ok(Date.now() - t0 < 1000, `settle_ms 1500 ran past the ${CAP_MS}ms ceiling: ${text}`);
+    assert.match(text, /wait ceiling/, `the answer should say the ceiling stopped it: ${text}`);
+
+    // delay_after_ms 0 still completes at once
+    result = await interactWithProcessLines({ pid, lines: [{ input: 'd', delay_after_ms: 0 }] }, CAP_MS);
+    assert.notStrictEqual(result.isError, true, `delay_after_ms 0 should succeed: ${result.content[0].text}`);
+  } finally {
+    await forceTerminate({ pid });
+  }
+  console.log('ok: a cut-short delay is reported, settle_ms is bounded, delay 0 still succeeds');
+}
+
 // The settings these tests change: they must be left as they were found
 const CHANGED_SETTINGS = ['fileReadLineLimit', 'allowedDirectories', 'blockedCommands'];
 
@@ -214,6 +247,7 @@ async function runAllTests() {
   await testNodeLocalWaitsWithinTheCeiling();
   await testTailFollowWaitsWithinTheCeiling();
   await testLineByLineWaitsWithinTheCeiling();
+  await testLineDelaysAndSettleWithinTheCeiling();
   const after = await configManager.getConfig();
   for (const key of CHANGED_SETTINGS) {
     assert.deepStrictEqual(after[key], before[key],

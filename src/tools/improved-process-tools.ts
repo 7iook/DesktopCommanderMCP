@@ -1184,9 +1184,17 @@ export async function interactWithProcessLines(args: unknown, maxWaitMs: number 
     let matched = false;
     let reason = 'prompt-matched';
     if (useDelay) {
-      await sleep(Math.max(0, Math.min(line.delay_after_ms as number, callDeadline - Date.now())));
-      matched = true;
-      reason = 'delay';
+      const delay = line.delay_after_ms as number;
+      const budget = callDeadline - Date.now();
+      if (delay > 0 && delay > budget) {
+        // Cut short by the ceiling: the step did not get the wait it asked for
+        await sleep(Math.max(0, budget));
+        reason = 'wait-ceiling';
+      } else {
+        await sleep(delay);
+        matched = true;
+        reason = 'delay';
+      }
     } else {
       const deadline = Math.min(Date.now() + lineTimeout, callDeadline);
       while (Date.now() < deadline) {
@@ -1261,12 +1269,14 @@ export async function interactWithProcessLines(args: unknown, maxWaitMs: number 
     // Regardless of fail_fast: the call has no time left to wait for anything.
     if (reason === 'wait-ceiling') {
       aborted = true;
-      abortReason = `Line ${i + 1} was still waiting for a prompt when this call reached its ${maxWaitMs}ms wait ceiling. Check the output, then send the remaining ${lines.length - i - 1} line(s) in another call.`;
+      const waiting = useDelay ? `had not finished its ${line.delay_after_ms}ms delay` : 'was still waiting for a prompt';
+      abortReason = `Line ${i + 1} ${waiting} when this call reached its ${maxWaitMs}ms wait ceiling. Check the output, then send the remaining ${lines.length - i - 1} line(s) in another call.`;
       break;
     }
 
     // Let stdout/stdin settle before the next send.
-    if (i < lines.length - 1 && settle_ms > 0) await sleep(settle_ms);
+    // Bounded by the call's ceiling too; the check before the next send reports it
+    if (i < lines.length - 1 && settle_ms > 0) await sleep(Math.max(0, Math.min(settle_ms, callDeadline - Date.now())));
   }
 
   // Final state + aggregated output.
