@@ -1285,7 +1285,8 @@ export class TerminalManager {
       shell: session.shell,
       startTime: session.startTime.getTime(),
       runtimeMs: endMs - session.startTime.getTime(),
-      sinceLastOutputMs: session.lastOutputAt === undefined ? null : now - session.lastOutputAt,
+      // Up to the exit for an exited process: time after it says nothing about the process
+      sinceLastOutputMs: session.lastOutputAt === undefined ? null : Math.max(0, Math.min(now, endMs) - session.lastOutputAt),
       exitCode: completed?.exitCode,
       signal: completed?.signal,
       totalLines: total,

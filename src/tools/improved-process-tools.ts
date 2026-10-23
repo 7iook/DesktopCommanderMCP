@@ -653,11 +653,21 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
         let resolved = false;
         let interval: NodeJS.Timeout | null = null;
         let timeout: NodeJS.Timeout | null = null;
+        let resample: NodeJS.Timeout | null = null;
 
         const cleanup = () => {
           if (interval) clearInterval(interval);
           if (timeout) clearTimeout(timeout);
+          if (resample) clearTimeout(resample);
         };
+
+        // The sample taken when the wait began is as old as the wait by the
+        // time a long wait ends: take another shortly before it ends
+        if (session && effectiveWaitMs > TREE_RESAMPLE_LEAD_MS * 2) {
+          resample = setTimeout(() => {
+            treeSampler.start(session.pid).catch(() => undefined);
+          }, effectiveWaitMs - TREE_RESAMPLE_LEAD_MS);
+        }
 
         const resolveOnce = () => {
           if (resolved) return;
@@ -829,6 +839,8 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
 const MAX_WATCH_PATHS = 8;
 /** Extra time a read may spend on the tree sample and the file scan, together */
 const OBSERVATION_BUDGET_MS = 300;
+/** How long before a wait's end the tree is sampled again (a Windows sample takes ~0.5-1s) */
+const TREE_RESAMPLE_LEAD_MS = 2000;
 /** Part of it the file scan may use; the tree sample runs alongside */
 const FILE_SCAN_BUDGET_MS = 150;
 
@@ -895,8 +907,12 @@ export async function buildStatusBlock(info: ProcessStatusInfo, read: ReadFacts)
   }
 
   const hints: string[] = [];
+  const keepsPollingEmpty = alive && read.thisRead === 0 && read.emptyReads >= 2;
   if (read.capped) {
-    hints.push(`This wait stopped at the per-call limit (${read.capMs}ms), not at timeout_ms=${read.requestedMs}; the process keeps running. Call read_process_output again to keep waiting.`);
+    // After repeated empty reads the hints below say how to go on; "call again" would contradict them
+    hints.push(keepsPollingEmpty
+      ? `This wait stopped at the per-call limit (${read.capMs}ms), not at timeout_ms=${read.requestedMs}; the process keeps running.`
+      : `This wait stopped at the per-call limit (${read.capMs}ms), not at timeout_ms=${read.requestedMs}; the process keeps running. Call read_process_output again to keep waiting.`);
   }
   if (alive && read.thisRead === 0 && read.emptyReads === 2) {
     hints.push(`No new output for 2 reads in a row. The process may print only when it finishes (e.g. it captures a child's output, or buffers it). Look at the tree/files lines above, or call read_process_output(pid=${info.pid}, wait_until="exit") to wait for the exit instead of for output.`);

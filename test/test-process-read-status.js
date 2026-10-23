@@ -85,8 +85,15 @@ async function longSilentAndCapped(dir) {
     assert.match(capped, /wait: requested=5000ms actual=\d+ms capped=true\(cap=700\) reason=timeout/, capped);
     assert.match(capped, /\[hint\] This wait stopped at the per-call limit \(700ms\)/, capped);
     let text = '';
-    for (let i = 0; i < 3; i++) text = textOf(await readProcessOutput({ pid, timeout_ms: 1500 }, 1500));
+    for (let i = 0; i < 3; i++) text = textOf(await readProcessOutput({ pid, timeout_ms: 6000 }, 5000));
     assert.match(text, /empty_reads_in_a_row=4/, text);
+    // Capped after repeated empty reads: no "call again" next to "stop polling"
+    assert.match(text, /\[hint\] This wait stopped at the per-call limit \(5000ms\)[^\n]*keeps running\.\n/, text);
+    assert(!text.includes('Call read_process_output again'), `no "call again" once the hints say stop polling: ${text}`);
+    assert.match(text, /Stop polling/, text);
+    // Sampled again shortly before the 4s wait ended, not when it began
+    const age = Number(text.match(/sampled=([\d.]+)s_ago/)?.[1]);
+    assert(age < 3, `the tree sample is from near the end of the wait, got ${age}s ago: ${text}`);
     assert.match(text, /tree: \d+ procs \([^)]*node/i, `the tree shows node after a full wait: ${text}`);
     assert.match(text, /cpu_delta=\+[\d.]+s over [\d.]+s|cpu_total=/, text);
     assert.match(text, /Low CPU does not mean it is stuck/, text);
@@ -133,7 +140,12 @@ async function waitUntilExitIgnoresOutput(dir) {
   assert.match(text, /tick 9/, `one read returns everything up to the exit: ${text}`);
   assert.match(text, /state=exited/, text);
   assert.match(text, /reason=exit until=exit/, text);
-  console.log('✓ wait_until=exit: intermediate output does not end the wait');
+  // Measured up to the exit, not up to this read
+  await sleep(1500);
+  const later = textOf(await readProcessOutput({ pid, offset: -1 }, 100));
+  const since = Number(later.match(/since_last_output=([\d.]+)s/)?.[1]);
+  assert(since < 1, `since_last_output of an exited process stops at the exit, got ${since}s: ${later}`);
+  console.log('✓ wait_until=exit: intermediate output does not end the wait; since_last_output stops at the exit');
 }
 
 async function stderrTailKeptAtExit(dir) {
