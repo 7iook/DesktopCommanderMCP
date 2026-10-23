@@ -105,18 +105,26 @@ interface ManagedSession extends TerminalSession {
  * fires once they are all closed: then the output is complete. A session that
  * gets no 'close' within EXIT_CLOSE_GRACE_MS is finalized anyway
  * (forced_close); output that arrives later is still appended for
- * LATE_OUTPUT_WINDOW_MS and counted as late lines, then the pipes are released.
+ * LATE_OUTPUT_WINDOW_MS and counted as late lines. After that it is read and
+ * dropped (counted as dropped lines): the pipes stay open, since closing them
+ * would make every later write of that process fail (EPIPE / EINVAL).
  */
 interface DrainState {
   exitAt: number;
   finalizedAt?: number;          // Unset while draining
   forced: boolean;               // Finalized by the grace timer, not by 'close'
   linesAtFinalize?: number;      // Total lines when finalized, to count late lines
-  released: boolean;             // Pipes destroyed after the late-output window
+  released: boolean;             // Late-output window over: output is read and dropped
+  droppedLines?: number;         // Lines dropped after the window
 }
 
 export const EXIT_CLOSE_GRACE_MS = 2000;
 export const LATE_OUTPUT_WINDOW_MS = 30_000;
+let lateOutputWindowMs = LATE_OUTPUT_WINDOW_MS;
+/** Tests only: a shorter late-output window */
+export function setLateOutputWindowMsForTests(ms: number = LATE_OUTPUT_WINDOW_MS): void {
+  lateOutputWindowMs = ms;
+}
 export const MAX_COMPLETED_SESSIONS = 100;
 export const MAX_EVICTED_TOMBSTONES = 500;
 
@@ -147,6 +155,8 @@ export interface ProcessStatusInfo {
   stderrLines: number;
   outputIntegrity?: 'complete' | 'forced_close';   // Set once exited and finalized
   lateLines: number;
+  droppedLines: number;          // Read and dropped after the late-output window (0 before it ends)
+  windowOver: boolean;           // The late-output window ended
   emptyReads: number;
   cwd: string;
   watchPaths?: string[];
@@ -504,6 +514,7 @@ export class TerminalManager {
       childProcess.stdout.on('data', (data: any) => {
         const text = stdoutDecoder.write(Buffer.isBuffer(data) ? data : Buffer.from(data));
         if (!text) return;
+        if (TerminalManager.dropAfterWindow(session, text)) return;
         const now = Date.now();
 
         if (!firstOutputTime) firstOutputTime = now;
@@ -550,6 +561,7 @@ export class TerminalManager {
       childProcess.stderr.on('data', (data: any) => {
         const text = stderrDecoder.write(Buffer.isBuffer(data) ? data : Buffer.from(data));
         if (!text) return;
+        if (TerminalManager.dropAfterWindow(session, text)) return;
         const now = Date.now();
 
         if (!firstOutputTime) firstOutputTime = now;
@@ -621,12 +633,14 @@ export class TerminalManager {
         drain.linesAtFinalize = TerminalManager.totalLineCount(session);
         if (forced) {
           // Something still holds the pipes (a child the command started): keep
-          // appending what it writes for a while, then let the pipes go.
+          // appending what it writes for a while, then keep reading and drop it.
+          // Not destroy(): the child's writes would then fail and may kill it.
+          // unref(): the open pipes must not keep this server alive.
           setTimeout(() => {
             drain.released = true;
-            childProcess.stdout?.destroy();
-            childProcess.stderr?.destroy();
-          }, LATE_OUTPUT_WINDOW_MS).unref();
+            (childProcess.stdout as any)?.unref?.();
+            (childProcess.stderr as any)?.unref?.();
+          }, lateOutputWindowMs).unref();
         }
         exitReason = 'process_exit';
         resolveOnce({
@@ -1200,6 +1214,14 @@ export class TerminalManager {
     return 'failed';
   }
 
+  /** After the late-output window: count and drop the text instead of recording it */
+  private static dropAfterWindow(session: { drain?: DrainState }, text: string): boolean {
+    const drain = session.drain;
+    if (!drain?.released) return false;
+    drain.droppedLines = (drain.droppedLines ?? 0) + Math.max(1, text.split('\n').length - 1);
+    return true;
+  }
+
   /** Lines since process start, evicted ones included */
   private static totalLineCount(session: OutputBuffer): number {
     const lines = session.outputLines;
@@ -1294,6 +1316,8 @@ export class TerminalManager {
       stderrLines: session.newlines?.stderr ?? 0,
       outputIntegrity: drain?.finalizedAt !== undefined ? (drain.forced ? 'forced_close' : 'complete') : undefined,
       lateLines: drain?.linesAtFinalize !== undefined ? Math.max(0, total - drain.linesAtFinalize) : 0,
+      droppedLines: drain?.droppedLines ?? 0,
+      windowOver: Boolean(drain?.released),
       emptyReads: session.emptyReads ?? 0,
       cwd: session.cwd,
       watchPaths: session.watchPaths

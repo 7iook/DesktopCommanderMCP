@@ -194,7 +194,7 @@ const SKIPPED_DIRS = new Set(['.git', 'node_modules', '__pycache__', '.venv', 'v
 export async function scanChangedFiles(
   roots: string[],
   sinceMs: number,
-  { deadline, maxDepth = 3, maxEntries = 5000 }: { deadline: number; maxDepth?: number; maxEntries?: number }
+  { deadline, maxDepth = 3, maxEntries = 5000, untilMs = Infinity }: { deadline: number; maxDepth?: number; maxEntries?: number; untilMs?: number }
 ): Promise<FileScanResult> {
   const files: ChangedFile[] = [];
   let scannedEntries = 0;
@@ -211,7 +211,7 @@ export async function scanChangedFiles(
       if (depth === 0) {
         try {
           const stat = await fs.lstat(dir);
-          if (stat.isFile() && stat.mtimeMs >= sinceMs) files.push({ path: dir, size: stat.size, mtimeMs: stat.mtimeMs });
+          if (stat.isFile() && stat.mtimeMs >= sinceMs && stat.mtimeMs <= untilMs) files.push({ path: dir, size: stat.size, mtimeMs: stat.mtimeMs });
         } catch {
           // Missing: nothing changed there
         }
@@ -230,7 +230,7 @@ export async function scanChangedFiles(
       if (Date.now() >= deadline) { partial = true; break; }
       try {
         const stat = await fs.lstat(full);
-        if (stat.mtimeMs >= sinceMs) files.push({ path: full, size: stat.size, mtimeMs: stat.mtimeMs });
+        if (stat.mtimeMs >= sinceMs && stat.mtimeMs <= untilMs) files.push({ path: full, size: stat.size, mtimeMs: stat.mtimeMs });
       } catch {
         // Gone or unreadable: not a candidate
       }

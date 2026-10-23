@@ -11,7 +11,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { startProcess, readProcessOutput, forceTerminate } from '../dist/tools/improved-process-tools.js';
-import { TerminalManager, MAX_COMPLETED_SESSIONS, MAX_EVICTED_TOMBSTONES } from '../dist/terminal-manager.js';
+import { TerminalManager, MAX_COMPLETED_SESSIONS, MAX_EVICTED_TOMBSTONES, setLateOutputWindowMsForTests } from '../dist/terminal-manager.js';
 import { parsePsTime, descendantsOf, formatTreeLine, scanChangedFiles } from '../dist/utils/process-activity.js';
 import { spawnSync } from 'child_process';
 import { runIfMain, skip } from './helpers/run-if-main.js';
@@ -131,6 +131,59 @@ async function outputAfterExit(dir) {
   assert.match(later, /late_lines=1/, later);
   assert.match(later, /\[hint\] 1 line\(s\) arrived after the output was finalized/, later);
   console.log('✓ output after the exit: forced close after the grace period, late lines appended and counted');
+}
+
+/**
+ * A background process still writing to the pipes after the late-output
+ * window keeps running (its writes do not fail), and its output is dropped and
+ * counted. Before the fix the pipes were destroyed and the writer died.
+ */
+async function writerOutlivesLateWindow(dir) {
+  setLateOutputWindowMsForTests(1000);
+  const marker = path.join(dir, 'writer-done.txt');
+  const child = fixture(dir, 'late-writer.js',
+    `let i=0;const t=setInterval(()=>{console.log('tick '+i);i++;if(i>=25){clearInterval(t);require('fs').writeFileSync(${q(marker)},'done '+i);}},200);`);
+  try {
+    const pid = process.platform === 'win32'
+      ? await start(`start /b node ${q(child)} & echo parent done`, dir, { shell: 'cmd.exe' })
+      : await start(`node ${q(child)} & echo parent done`, dir, { shell: '/bin/sh' });
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline && !fs.existsSync(marker)) await sleep(200);
+    assert(fs.existsSync(marker), 'the background writer ran to its end after the late-output window');
+    assert.strictEqual(fs.readFileSync(marker, 'utf8'), 'done 25');
+    await sleep(300);
+    const text = textOf(await readProcessOutput({ pid, offset: -3 }, 100));
+    assert.match(text, /integrity=forced_close late_lines=\d+ dropped_after_window=[1-9]\d*/, text);
+    assert.match(text, /\[hint\] \d+ line\(s\) written after the late-output window were read and dropped/, text);
+    assert(!/tick 24/.test(text), `output after the window is not recorded: ${text}`);
+  } finally {
+    setLateOutputWindowMsForTests();
+  }
+  console.log('✓ late-output window over: a background writer keeps running, its output is dropped and counted');
+}
+
+/** An exited process lists only files changed while it ran; a capped wait_until=exit read says to call the same again */
+async function exitedFilesAndCappedExitWait(dir) {
+  const sub = path.join(dir, 'files-until-exit');
+  fs.mkdirSync(sub);
+  const quick = await start('node -e "require(\'fs\').writeFileSync(\'mine.txt\',\'m\')"', sub);
+  await sleep(1500);
+  fs.writeFileSync(path.join(sub, 'other.txt'), 'o');
+  const text = textOf(await readProcessOutput({ pid: quick, offset: -1 }, 100));
+  assert.match(text, /mine\.txt/, text);
+  assert(!text.includes('other.txt'), `a file changed after the exit is not listed: ${text}`);
+
+  const pid = await start('node -e "setTimeout(()=>{},20000)"', dir);
+  try {
+    let read = '';
+    for (let i = 0; i < 3; i++) read = textOf(await readProcessOutput({ pid, timeout_ms: 5000, wait_until: 'exit' }, 700));
+    assert.match(read, /capped=true\(cap=700\) reason=timeout until=exit/, read);
+    assert.match(read, /Call read_process_output\(pid=\d+, wait_until="exit"\) again to keep waiting for the exit/, read);
+    assert(!/Stop polling|reads in a row/.test(read), `no empty-read hints for a wait_until=exit read: ${read}`);
+  } finally {
+    await forceTerminate({ pid });
+  }
+  console.log('✓ exited: files limited to the run; capped wait_until=exit: "call the same again"');
 }
 
 async function waitUntilExitIgnoresOutput(dir) {
@@ -257,6 +310,8 @@ export default async function runTests() {
     await printsAtEndWritesFileMidway(dir);
     await longSilentAndCapped(dir);
     await outputAfterExit(dir);
+    await writerOutlivesLateWindow(dir);
+    await exitedFilesAndCappedExitWait(dir);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }

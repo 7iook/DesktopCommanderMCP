@@ -839,6 +839,8 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
 const MAX_WATCH_PATHS = 8;
 /** Extra time a read may spend on the tree sample and the file scan, together */
 const OBSERVATION_BUDGET_MS = 300;
+/** Slack for file mtimes vs. the exit time (coarse mtime resolution, writes just before exit) */
+const FILE_MTIME_SLACK_MS = 1000;
 /** How long before a wait's end the tree is sampled again (a Windows sample takes ~0.5-1s) */
 const TREE_RESAMPLE_LEAD_MS = 2000;
 /** Part of it the file scan may use; the tree sample runs alongside */
@@ -877,7 +879,7 @@ export async function buildStatusBlock(info: ProcessStatusInfo, read: ReadFacts)
   lines.push(`  wait: requested=${read.requestedMs}ms actual=${read.waitedMs}ms capped=${read.capped ? `true(cap=${read.capMs})` : 'false'} reason=${read.reason}${read.waitUntil === 'exit' ? ' until=exit' : ''}`);
   lines.push(`  lines: this_read=${read.thisRead} total=${info.totalLines} (stdout=${info.stdoutLines} stderr=${info.stderrLines}) empty_reads_in_a_row=${read.emptyReads}`);
   if (info.outputIntegrity) {
-    lines.push(`  output: integrity=${info.outputIntegrity} late_lines=${info.lateLines}`);
+    lines.push(`  output: integrity=${info.outputIntegrity} late_lines=${info.lateLines}${info.windowOver ? ` dropped_after_window=${info.droppedLines}` : ''}`);
   }
 
   // Clues: only when they can explain silence (nothing returned, or the process ended)
@@ -886,7 +888,8 @@ export async function buildStatusBlock(info: ProcessStatusInfo, read: ReadFacts)
     const scanDeadline = observeStart + FILE_SCAN_BUDGET_MS;
     const watched = Boolean(info.watchPaths && info.watchPaths.length > 0);
     const scanPromise: Promise<FileScanResult | undefined> = watched
-      ? scanChangedFiles(info.watchPaths!, info.startTime, { deadline: scanDeadline }).catch(() => undefined)
+      // An exited process: only files changed while it ran (plus mtime slack), not what others wrote later
+      ? scanChangedFiles(info.watchPaths!, info.startTime, { deadline: scanDeadline, untilMs: alive ? Infinity : info.startTime + info.runtimeMs + FILE_MTIME_SLACK_MS }).catch(() => undefined)
       : Promise.resolve(undefined);
     let treeLine: string | undefined;
     if (alive) {
@@ -907,14 +910,20 @@ export async function buildStatusBlock(info: ProcessStatusInfo, read: ReadFacts)
   }
 
   const hints: string[] = [];
-  const keepsPollingEmpty = alive && read.thisRead === 0 && read.emptyReads >= 2;
-  if (read.capped) {
+  const untilExit = read.waitUntil === 'exit';
+  const keepsPollingEmpty = alive && read.thisRead === 0 && read.emptyReads >= 2 && !untilExit;
+  if (read.capped && untilExit) {
+    // Already waiting for the exit: calling the same again is the right next step
+    hints.push(`This wait stopped at the per-call limit (${read.capMs}ms), not at timeout_ms=${read.requestedMs}; the process keeps running. Call read_process_output(pid=${info.pid}, wait_until="exit") again to keep waiting for the exit; use force_terminate only if the run clearly exceeds its expected duration.`);
+  } else if (read.capped) {
     // After repeated empty reads the hints below say how to go on; "call again" would contradict them
     hints.push(keepsPollingEmpty
       ? `This wait stopped at the per-call limit (${read.capMs}ms), not at timeout_ms=${read.requestedMs}; the process keeps running.`
       : `This wait stopped at the per-call limit (${read.capMs}ms), not at timeout_ms=${read.requestedMs}; the process keeps running. Call read_process_output again to keep waiting.`);
   }
-  if (alive && read.thisRead === 0 && read.emptyReads === 2) {
+  if (untilExit) {
+    // The empty-read hints below would only suggest the wait_until="exit" this read already used
+  } else if (alive && read.thisRead === 0 && read.emptyReads === 2) {
     hints.push(`No new output for 2 reads in a row. The process may print only when it finishes (e.g. it captures a child's output, or buffers it). Look at the tree/files lines above, or call read_process_output(pid=${info.pid}, wait_until="exit") to wait for the exit instead of for output.`);
   } else if (alive && read.thisRead === 0 && read.emptyReads >= 3) {
     hints.push(
@@ -932,6 +941,9 @@ export async function buildStatusBlock(info: ProcessStatusInfo, read: ReadFacts)
   }
   if (info.outputIntegrity === 'forced_close' && info.lateLines > 0) {
     hints.push(`${info.lateLines} line(s) arrived after the output was finalized (a process it started kept the pipes open); they are in the buffer and readable.`);
+  }
+  if (info.windowOver && info.droppedLines > 0) {
+    hints.push(`${info.droppedLines} line(s) written after the late-output window were read and dropped, not recorded (a process it started still writes to the pipes). Have it write to a log file to keep that output.`);
   }
   for (const hint of hints) lines.push(`[hint] ${hint}`);
   return `\n\n${lines.join('\n')}`;
