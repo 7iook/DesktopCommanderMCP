@@ -1,4 +1,5 @@
-import { terminalManager, MAX_BUFFERED_OUTPUT_CHARS, getProcessWaitLimit } from '../terminal-manager.js';
+import { terminalManager, MAX_BUFFERED_OUTPUT_CHARS, getProcessWaitLimit, EXIT_CLOSE_GRACE_MS, type ProcessStatusInfo } from '../terminal-manager.js';
+import { treeSampler, formatTreeLine, scanChangedFiles, formatFileLines, type FileScanResult } from '../utils/process-activity.js';
 import { commandManager } from '../command-manager.js';
 import { StartProcessArgsSchema, ReadProcessOutputArgsSchema, InteractWithProcessArgsSchema, InteractWithProcessLinesArgsSchema, ForceTerminateArgsSchema, ListSessionsArgsSchema } from './schemas.js';
 import { capture } from "../utils/capture.js";
@@ -366,6 +367,25 @@ export async function startProcess(args: unknown, maxWaitMs: number = MAX_PROCES
     }
   }
 
+  // Folders read_process_output scans for files the process changed while it
+  // prints nothing: watch_paths, else the cwd. Each must pass the same
+  // allowed-directory check as the file tools; a path that doesn't is left out.
+  const watchCandidates = (parsed.data.watch_paths && parsed.data.watch_paths.length > 0
+    ? parsed.data.watch_paths
+    : [resolvedCwd ?? process.cwd()]).slice(0, MAX_WATCH_PATHS);
+  const watchPaths: string[] = [];
+  const watchRejected: string[] = [];
+  {
+    const { validatePath } = await import('./filesystem.js');
+    for (const candidate of watchCandidates) {
+      try {
+        watchPaths.push(await validatePath(candidate));
+      } catch {
+        watchRejected.push(candidate);
+      }
+    }
+  }
+
   const result = await terminalManager.executeCommand(
     commandToRunEffective,
     parsed.data.timeout_ms,
@@ -402,6 +422,12 @@ export async function startProcess(args: unknown, maxWaitMs: number = MAX_PROCES
       content: [{ type: "text", text: result.output + antiPatternHint }],
       isError: true,
     };
+  }
+
+  terminalManager.setWatchPaths(result.pid, watchPaths);
+  // Only an explicit watch_paths entry that was refused is worth a line; a refused default cwd is silent
+  if (parsed.data.watch_paths && watchRejected.length > 0) {
+    antiPatternHint += `\n\nwatch_paths not watched (outside allowed directories or invalid): ${watchRejected.join(', ')}`;
   }
 
   // Whether the process is waiting for input, as detected when the wait ended
@@ -552,15 +578,27 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
     offset = 0,                    // 0 = from last read, positive = absolute, negative = tail
     length = defaultLength,        // Default from config, same as file reading
     follow_ms,                     // tail -f window (ms); see schema
+    wait_until = 'output',         // 'exit': wait for the exit, not for output
     verbose_timing = false 
   } = parsed.data;
 
   // Timing telemetry
   const startTime = Date.now();
-  const { waitMs } = getProcessWaitLimit(timeout_ms, maxWaitMs);
+  const waitLimit = getProcessWaitLimit(timeout_ms, maxWaitMs);
+  const { waitMs } = waitLimit;
 
   // For active sessions with no new output yet, optionally wait for output
   const session = terminalManager.getSession(pid);
+  // Exited, output not final yet (see DrainState): still worth waiting for
+  const draining = !session && terminalManager.isDraining(pid);
+  const isOver = () => !terminalManager.getSession(pid) && !terminalManager.isDraining(pid);
+  let waitReason = 'none' as 'output' | 'exit' | 'timeout' | 'none';
+
+  // Start sampling the process tree now, so the sample (slow on Windows)
+  // runs during the wait instead of after it
+  if (session) {
+    treeSampler.start(session.pid).catch(() => undefined);
+  }
 
   // tail -f follow for absolute/tail reads (offset !== 0). This waits for NEW
   // output to be appended, then falls through to the normal read below. For
@@ -593,14 +631,21 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
     });
   }
 
-  if (session && offset === 0) {
+  if ((session || draining) && offset === 0) {
     // Wait for new output to arrive (only for "new output" reads, not absolute/tail)
     // follow_ms overrides timeout_ms, both capped by the per-call wait limit (upstream getProcessWaitLimit)
     const effectiveWaitMs = (follow_ms && follow_ms > 0) ? Math.min(follow_ms, waitMs) : waitMs;
+    const untilExit = wait_until === 'exit';
     const waitForOutput = (): Promise<void> => {
       return new Promise((resolve) => {
         // Check if there's already new output
-        if (terminalManager.hasUnreadOutput(pid)) {
+        if (!untilExit && terminalManager.hasUnreadOutput(pid)) {
+          waitReason = 'output';
+          resolve();
+          return;
+        }
+        if (isOver()) {
+          waitReason = 'exit';
           resolve();
           return;
         }
@@ -623,14 +668,21 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
 
         // Poll for new output, or for the exit (the session is then no
         // longer active): a process that exited writes nothing more itself
+        // (wait_until=exit ignores output). A draining session is waited for
+        // until its output is final, at most EXIT_CLOSE_GRACE_MS.
         interval = setInterval(() => {
-          if (terminalManager.hasUnreadOutput(pid) || !terminalManager.getSession(pid)) {
+          if (isOver()) {
+            waitReason = 'exit';
+            resolveOnce();
+          } else if (!untilExit && terminalManager.hasUnreadOutput(pid)) {
+            waitReason = 'output';
             resolveOnce();
           }
         }, 50);
 
         // Timeout
         timeout = setTimeout(() => {
+          waitReason = 'timeout';
           resolveOnce();
         }, effectiveWaitMs);
       });
@@ -642,9 +694,22 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
   // Read output with pagination. offset<0 is a true tail of the current
   // buffer; offset=0 is cursor-based (advances lastReadIndex); offset>0 is
   // absolute. The trailing empty-line artifact is handled inside readOutputPaginated.
+  const waitedMs = Date.now() - startTime;
   const result = terminalManager.readOutputPaginated(pid, offset, length);
   
   if (!result) {
+    const evicted = terminalManager.getEvictedSession(pid);
+    if (evicted) {
+      const ending = evicted.exitCode === null && evicted.signal ? `signal=${evicted.signal}` : `exit_code=${evicted.exitCode}`;
+      return {
+        content: [{
+          type: "text",
+          text: `[process] state=evicted pid=${pid} ${ending} ended=${evicted.endTime.toISOString()} total_lines=${evicted.totalLines} fully_read=${evicted.readComplete}\n` +
+            `[hint] This process exited and its output was dropped from the completed-process cache (the most recent 100 are kept). ` +
+            `It cannot be read again; re-run the command (or have it write to a file) if you still need the output.`
+        }],
+      };
+    }
     return {
       content: [{ type: "text", text: `No session found for PID ${pid}` }],
       isError: true,
@@ -696,6 +761,23 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
     }
   }
 
+  // The status block: facts about the process and this read, then clues
+  // (tree, changed files), then what to do next. Bounded at OBSERVATION_BUDGET_MS.
+  const emptyReads = offset === 0 ? terminalManager.noteRead(pid, result.readCount) : (terminalManager.getStatusInfo(pid)?.emptyReads ?? 0);
+  const info = terminalManager.getStatusInfo(pid);
+  const statusBlock = info
+    ? await buildStatusBlock(info, {
+        requestedMs: timeout_ms,
+        waitedMs,
+        capMs: waitLimit.capMs,
+        capped: waitLimit.capped && waitReason === 'timeout',
+        reason: waitReason,
+        thisRead: result.readCount,
+        emptyReads,
+        waitUntil: wait_until,
+      })
+    : '';
+
   // Add timing information if requested
   let timingMessage = '';
   if (verbose_timing) {
@@ -738,9 +820,105 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
   return {
     content: [{
       type: "text",
-      text: `${statusMessage}\n\n${cappedResponse}${processStateMessage}${emptyOutputHint}${timingMessage}`
+      text: `${statusMessage}\n\n${cappedResponse}${processStateMessage}${emptyOutputHint}${statusBlock}${timingMessage}`
     }],
   };
+}
+
+/** watch_paths entries start_process keeps */
+const MAX_WATCH_PATHS = 8;
+/** Extra time a read may spend on the tree sample and the file scan, together */
+const OBSERVATION_BUDGET_MS = 300;
+/** Part of it the file scan may use; the tree sample runs alongside */
+const FILE_SCAN_BUDGET_MS = 150;
+
+interface ReadFacts {
+  requestedMs: number;
+  waitedMs: number;
+  capMs: number;
+  capped: boolean;
+  reason: 'output' | 'exit' | 'timeout' | 'none';
+  thisRead: number;
+  emptyReads: number;
+  waitUntil: 'output' | 'exit';
+}
+
+function seconds(ms: number): string {
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/**
+ * read_process_output's status block. Facts first (state, timing, line
+ * counts, how this read's wait ended); then clues that may be wrong (the
+ * process tree, files changed under the watched folders: a changed file is a
+ * candidate, not proof this process wrote it); then hints, which get firmer
+ * as reads in a row come back empty. Exported for tests.
+ */
+export async function buildStatusBlock(info: ProcessStatusInfo, read: ReadFacts): Promise<string> {
+  const observeStart = Date.now();
+  const alive = info.state === 'running' || info.state === 'waiting_input';
+  const stateLabel = info.state === 'waiting_input' ? 'waiting_input(heuristic: output ends like a prompt)' : info.state;
+  const exitCode = info.exitCode === undefined || info.exitCode === null ? '-' : String(info.exitCode);
+  const lines: string[] = [];
+  lines.push(`[process] state=${stateLabel} pid=${info.pid}${info.shell ? ` shell=${info.shell}` : ''}`);
+  lines.push(`  runtime=${seconds(info.runtimeMs)} since_last_output=${info.sinceLastOutputMs === null ? 'never' : seconds(info.sinceLastOutputMs)} exit_code=${exitCode} signal=${info.signal ?? '-'}`);
+  lines.push(`  wait: requested=${read.requestedMs}ms actual=${read.waitedMs}ms capped=${read.capped ? `true(cap=${read.capMs})` : 'false'} reason=${read.reason}${read.waitUntil === 'exit' ? ' until=exit' : ''}`);
+  lines.push(`  lines: this_read=${read.thisRead} total=${info.totalLines} (stdout=${info.stdoutLines} stderr=${info.stderrLines}) empty_reads_in_a_row=${read.emptyReads}`);
+  if (info.outputIntegrity) {
+    lines.push(`  output: integrity=${info.outputIntegrity} late_lines=${info.lateLines}`);
+  }
+
+  // Clues: only when they can explain silence (nothing returned, or the process ended)
+  const wantClues = read.thisRead === 0 || !alive;
+  if (wantClues) {
+    const scanDeadline = observeStart + FILE_SCAN_BUDGET_MS;
+    const watched = Boolean(info.watchPaths && info.watchPaths.length > 0);
+    const scanPromise: Promise<FileScanResult | undefined> = watched
+      ? scanChangedFiles(info.watchPaths!, info.startTime, { deadline: scanDeadline }).catch(() => undefined)
+      : Promise.resolve(undefined);
+    let treeLine: string | undefined;
+    if (alive) {
+      const pending = treeSampler.latest(info.pid);
+      if (pending.pending) {
+        // Give an in-flight sample what is left of the budget
+        const left = Math.max(0, OBSERVATION_BUDGET_MS - (Date.now() - observeStart));
+        await Promise.race([treeSampler.start(info.pid), new Promise((resolve) => setTimeout(resolve, Math.min(left, FILE_SCAN_BUDGET_MS)))]);
+      }
+      const latest = treeSampler.latest(info.pid);
+      treeLine = formatTreeLine(latest.previous, latest.last, latest.pending);
+    } else {
+      treeSampler.forget(info.pid);
+    }
+    const scan = await scanPromise;
+    if (treeLine) lines.push(`  ${treeLine}`);
+    for (const fileLine of formatFileLines(scan, watched)) lines.push(`  ${fileLine}`);
+  }
+
+  const hints: string[] = [];
+  if (read.capped) {
+    hints.push(`This wait stopped at the per-call limit (${read.capMs}ms), not at timeout_ms=${read.requestedMs}; the process keeps running. Call read_process_output again to keep waiting.`);
+  }
+  if (alive && read.thisRead === 0 && read.emptyReads === 2) {
+    hints.push(`No new output for 2 reads in a row. The process may print only when it finishes (e.g. it captures a child's output, or buffers it). Look at the tree/files lines above, or call read_process_output(pid=${info.pid}, wait_until="exit") to wait for the exit instead of for output.`);
+  } else if (alive && read.thisRead === 0 && read.emptyReads >= 3) {
+    hints.push(
+      `${read.emptyReads} reads in a row returned no output while the process is still running. Stop polling for output: ` +
+      `check the files listed above (changed since the process started; not confirmed to be written by it), ` +
+      `call read_process_output(pid=${info.pid}, wait_until="exit") to wait for the exit, ` +
+      `and use force_terminate only if the run clearly exceeds its expected duration. Low CPU does not mean it is stuck: it may be waiting on the network or a child process.`
+    );
+  }
+  if (info.state === 'draining') {
+    hints.push(`The process exited but its output pipes are still open (a process it started may hold them); its output is final within ${EXIT_CLOSE_GRACE_MS}ms.`);
+  }
+  if (info.state === 'exited' && info.totalLines === 0 && info.exitCode === 0) {
+    hints.push(`The process exited with code 0 and wrote no output to its pipes. If it was expected to produce results, look for them in files it writes (see files above) rather than re-reading this output.`);
+  }
+  if (info.outputIntegrity === 'forced_close' && info.lateLines > 0) {
+    hints.push(`${info.lateLines} line(s) arrived after the output was finalized (a process it started kept the pipes open); they are in the buffer and readable.`);
+  }
+  for (const hint of hints) lines.push(`[hint] ${hint}`);
+  return `\n\n${lines.join('\n')}`;
 }
 
 /**

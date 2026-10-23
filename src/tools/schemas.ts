@@ -49,6 +49,10 @@ export const StartProcessArgsSchema = z.object({
   // var (only set/override). Useful for one-off proxy / token / flag
   // injection without polluting the global env.
   env: z.record(z.string()).optional(),
+  // Folders (or files) read_process_output checks for files changed since the
+  // process started, as a clue when it prints nothing. Default: the cwd. At
+  // most 8; each must be inside the allowed directories, others are skipped.
+  watch_paths: z.array(z.string()).optional(),
   // 'ui' marks widget-fired calls (e.g. open-in-folder/editor buttons);
   // excluded from tool-call telemetry (see isUiOriginCall in server.ts).
   origin: z.enum(['ui', 'llm']).optional(),
@@ -67,6 +71,10 @@ export const ReadProcessOutputArgsSchema = z.object({
   //   read_process_output({ pid, offset: -50, follow_ms: 3000 })
   // = "show me the last 50 lines, then tail for up to 3s".
   follow_ms: z.number().optional(),
+  // 'output' (default): return as soon as new output arrives. 'exit': ignore
+  // output and wait for the process to exit (offset=0 reads; still bounded by
+  // the per-call wait limit).
+  wait_until: z.enum(['output', 'exit']).optional(),
   verbose_timing: z.boolean().optional(),
 });
 

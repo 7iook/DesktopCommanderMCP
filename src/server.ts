@@ -1193,6 +1193,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         Process finished execution
                         Process running (use read_process_output)
 
+                        watch_paths (optional, default: the cwd): folders read_process_output checks for
+                        files changed since the process started, shown when the process prints nothing.
+
                         PERFORMANCE DEBUGGING (verbose_timing parameter):
                         Set verbose_timing: true to get detailed timing information including:
                         - Exit reason (early_exit_quick_pattern, early_exit_periodic_check, process_exit, timeout)
@@ -1247,6 +1250,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         Process waiting for input (ready for interact_with_process)
                         Process finished execution
                         Timeout reached (may still be running)
+
+                        STATUS BLOCK (appended to every read):
+                        [process] state=running|waiting_input|draining|exited pid, runtime, since_last_output, exit code;
+                        wait: requested/actual ms, capped=true when the per-call limit (not timeout_ms) ended the wait;
+                        lines: this read, total, per stream, empty reads in a row; output integrity once exited;
+                        tree / files: clues when nothing was returned (changed files are candidates, not proof);
+                        [hint]: what to do next. A process may print only when it finishes: after repeated empty
+                        reads, check the listed files or pass wait_until="exit" instead of polling again.
+                        - 'wait_until': "output" (default) or "exit" (wait for the exit, ignoring output)
 
                         ${CMD_PREFIX_DESCRIPTION}`,
                 inputSchema: zodToJsonSchema(ReadProcessOutputArgsSchema),

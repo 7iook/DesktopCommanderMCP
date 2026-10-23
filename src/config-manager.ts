@@ -44,6 +44,7 @@ export interface ServerConfig {
   responseMaxChars?: number;   // Tool-response character cap (Kiro IDE doesn't auto-truncate). Default 50000.
   initialOutputMaxChars?: number; // start_process initial-output cap. Default 16000.
   defaultProcessCwd?: string;  // Default cwd for start_process when not supplied; ~ expanded; fallback to env then inherited cwd.
+  injectPythonEnv?: boolean; // When not false (default), start_process sets PYTHONUNBUFFERED=1 / PYTHONIOENCODING=utf-8 unless already set.
   disableShellEncodingPatching?: boolean; // When true, skip the UTF-8 prefix + -OutputFormat Text injection (legacy behavior).
   clientId?: string; // Unique client identifier for analytics
   currentClient?: ClientInfo; // Current connected client information

@@ -88,7 +88,68 @@ function newStreamTails(): StreamTails {
 /** An active session plus the per-stream tails that state detection reads. */
 interface ManagedSession extends TerminalSession {
   streams: StreamTails;
+  lastOutputAt?: number;                          // When the latest chunk arrived (ms epoch)
+  newlines: Record<OutputStream, number>;         // Line breaks each stream delivered (its line count)
+  emptyReads: number;                             // read_process_output calls in a row that returned no lines
+  readComplete: boolean;                          // A default read has returned all output after the exit
+  cwd: string;                                    // Where the command runs (for the file scan)
+  shell?: string;
+  watchPaths?: string[];                          // Validated folders read_process_output scans for changed files
+  drain?: DrainState;                             // Set at exit
   termination?: Promise<boolean>;  // The forceTerminate in progress (or done); calls meanwhile await it, a failed one is dropped
+}
+
+/**
+ * Output after the exit. 'exit' fires when the process ends; its pipes may
+ * still hold output, and a process it started may keep them open. 'close'
+ * fires once they are all closed: then the output is complete. A session that
+ * gets no 'close' within EXIT_CLOSE_GRACE_MS is finalized anyway
+ * (forced_close); output that arrives later is still appended for
+ * LATE_OUTPUT_WINDOW_MS and counted as late lines, then the pipes are released.
+ */
+interface DrainState {
+  exitAt: number;
+  finalizedAt?: number;          // Unset while draining
+  forced: boolean;               // Finalized by the grace timer, not by 'close'
+  linesAtFinalize?: number;      // Total lines when finalized, to count late lines
+  released: boolean;             // Pipes destroyed after the late-output window
+}
+
+export const EXIT_CLOSE_GRACE_MS = 2000;
+export const LATE_OUTPUT_WINDOW_MS = 30_000;
+export const MAX_COMPLETED_SESSIONS = 100;
+export const MAX_EVICTED_TOMBSTONES = 500;
+
+/** What remains of a completed session dropped from the completed-session cap */
+export interface EvictedSession {
+  pid: number;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  endTime: Date;
+  totalLines: number;
+  readComplete: boolean;
+}
+
+export type ProcessLifecycleState = 'running' | 'waiting_input' | 'draining' | 'exited';
+
+/** Facts about a session for read_process_output's status block */
+export interface ProcessStatusInfo {
+  pid: number;
+  state: ProcessLifecycleState;
+  shell?: string;
+  startTime: number;
+  runtimeMs: number;
+  sinceLastOutputMs: number | null;   // null: no output yet
+  exitCode: number | null | undefined;
+  signal: NodeJS.Signals | null | undefined;
+  totalLines: number;
+  stdoutLines: number;
+  stderrLines: number;
+  outputIntegrity?: 'complete' | 'forced_close';   // Set once exited and finalized
+  lateLines: number;
+  emptyReads: number;
+  cwd: string;
+  watchPaths?: string[];
 }
 
 /** Outcome of forceTerminate */
@@ -176,6 +237,7 @@ export interface PaginatedOutputResult {
 export class TerminalManager {
   private sessions: Map<number, ManagedSession> = new Map();
   private completedSessions: Map<number, CompletedSession> = new Map();
+  private evictedSessions: Map<number, EvictedSession> = new Map();
   private deliveryTurn = 0;
   private deliveryTurnOpen = false;
 
@@ -260,6 +322,16 @@ export class TerminalManager {
       spawnOptions.env = { ...spawnOptions.env, ...envOverrides };
     }
 
+    // Python block-buffers stdout to a pipe, so a script printing as it goes
+    // shows nothing until it exits; and on Windows it encodes to the ANSI code
+    // page. Unless the environment already sets them (or config
+    // injectPythonEnv is false): unbuffered, UTF-8.
+    if (config.injectPythonEnv !== false && spawnOptions.env) {
+      const has = (name: string) => Object.keys(spawnOptions.env).some((key) => key.toUpperCase() === name);
+      if (!has('PYTHONUNBUFFERED')) spawnOptions.env.PYTHONUNBUFFERED = '1';
+      if (!has('PYTHONIOENCODING')) spawnOptions.env.PYTHONIOENCODING = 'utf-8';
+    }
+
     // Repair PATHEXT on Windows before spawning. On some Windows DXT launches
     // the server process inherits a corrupted PATHEXT (e.g. ".CPL"), which we
     // would otherwise propagate via { ...process.env } and break command
@@ -329,10 +401,17 @@ export class TerminalManager {
       evictedChars: 0,
       streams: newStreamTails(),
       stripCliXml: spawnConfig.stripCliXml === true,
-      cliXmlCarry: ''
+      cliXmlCarry: '',
+      newlines: { stdout: 0, stderr: 0 },
+      emptyReads: 0,
+      readComplete: false,
+      cwd: cwd ?? process.cwd(),
+      shell: shellToUse
     };
 
     this.sessions.set(childProcess.pid, session);
+    // A reused pid: the evicted record was another process
+    this.evictedSessions.delete(childProcess.pid);
 
     // Timing telemetry
     const startTime = Date.now();
@@ -521,35 +600,33 @@ export class TerminalManager {
         });
       }, waitLimit.waitMs);
 
-      childProcess.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
-        if (childProcess.pid) {
-          // Flush bytes the decoders held back mid-character, then any
-          // carried-but-incomplete CLIXML fragment (decoded bytes may complete
-          // the construct the filter is holding).
-          const stdoutTail = stdoutDecoder.flush();
-          if (stdoutTail) this.recordOutput(session, 'stdout', this.filterCliXmlStream(session, stdoutTail));
-          const stderrTail = stderrDecoder.flush();
-          if (stderrTail) this.recordOutput(session, 'stderr', this.filterCliXmlStream(session, stderrTail));
-          if (session.cliXmlCarry) {
-            const leftover = stripPsCliXml(session.cliXmlCarry);
-            session.cliXmlCarry = '';
-            if (leftover) this.recordOutput(session, 'stderr', leftover);
-          }
-          // Store completed session before removing active session
-          this.completedSessions.set(childProcess.pid, {
-            session,
-            exitCode: code,
-            signal,
-            endTime: new Date()
-          });
-
-          // Keep only last 100 completed sessions
-          if (this.completedSessions.size > 100) {
-            const oldestKey = Array.from(this.completedSessions.keys())[0];
-            this.completedSessions.delete(oldestKey);
-          }
-
-          this.sessions.delete(childProcess.pid);
+      // Ends the drain (see DrainState): on 'close', or forced EXIT_CLOSE_GRACE_MS after 'exit'
+      const finalizeOutput = (forced: boolean) => {
+        const drain = session.drain;
+        if (!drain || drain.finalizedAt !== undefined) return;
+        // Flush bytes the decoders held back mid-character, then any
+        // carried-but-incomplete CLIXML fragment (decoded bytes may complete
+        // the construct the filter is holding).
+        const stdoutTail = stdoutDecoder.flush();
+        if (stdoutTail) this.recordOutput(session, 'stdout', this.filterCliXmlStream(session, stdoutTail));
+        const stderrTail = stderrDecoder.flush();
+        if (stderrTail) this.recordOutput(session, 'stderr', this.filterCliXmlStream(session, stderrTail));
+        if (session.cliXmlCarry) {
+          const leftover = stripPsCliXml(session.cliXmlCarry);
+          session.cliXmlCarry = '';
+          if (leftover) this.recordOutput(session, 'stderr', leftover);
+        }
+        drain.finalizedAt = Date.now();
+        drain.forced = forced;
+        drain.linesAtFinalize = TerminalManager.totalLineCount(session);
+        if (forced) {
+          // Something still holds the pipes (a child the command started): keep
+          // appending what it writes for a while, then let the pipes go.
+          setTimeout(() => {
+            drain.released = true;
+            childProcess.stdout?.destroy();
+            childProcess.stderr?.destroy();
+          }, LATE_OUTPUT_WINDOW_MS).unref();
         }
         exitReason = 'process_exit';
         resolveOnce({
@@ -557,6 +634,31 @@ export class TerminalManager {
           output,
           isBlocked: false
         });
+      };
+
+      childProcess.on('close', () => finalizeOutput(false));
+
+      childProcess.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+        if (childProcess.pid) {
+          session.drain = { exitAt: Date.now(), forced: false, released: false };
+          // Store completed session before removing active session
+          this.completedSessions.set(childProcess.pid, {
+            session,
+            exitCode: code,
+            signal,
+            endTime: new Date()
+          });
+          this.retireCompletedSessions();
+          this.sessions.delete(childProcess.pid);
+          setTimeout(() => finalizeOutput(true), EXIT_CLOSE_GRACE_MS).unref();
+        } else {
+          exitReason = 'process_exit';
+          resolveOnce({
+            pid: childProcess.pid!,
+            output,
+            isBlocked: false
+          });
+        }
       });
     });
   }
@@ -570,6 +672,12 @@ export class TerminalManager {
     // turn would make the stream's old tail (e.g. a stale ">>> ") the latest output.
     if (!text) return;
     this.appendToLineBuffer(session, text);
+    session.lastOutputAt = Date.now();
+    if (session.newlines) {
+      let breaks = 0;
+      for (let i = text.indexOf('\n'); i !== -1; i = text.indexOf('\n', i + 1)) breaks++;
+      session.newlines[stream] += breaks;
+    }
     const tail = session.streams[stream];
     tail.text = (text.length >= STATE_DETECTION_TAIL_CHARS ? text : tail.text + text).slice(-STATE_DETECTION_TAIL_CHARS);
     tail.chars += text.length;
@@ -780,6 +888,10 @@ export class TerminalManager {
       );
       result.evictedLines = completedSession.session.evictedLines;
       result.signal = completedSession.signal;
+      // Everything was read after the drain ended: this session goes first when the cap evicts one
+      if (offset === 0 && result.remaining === 0 && completedSession.session.drain?.finalizedAt !== undefined) {
+        completedSession.session.readComplete = true;
+      }
       return result;
     }
 
@@ -1086,6 +1198,105 @@ export class TerminalManager {
     }
     capture('server_request_error', {error: 'Process tree termination failed', message: `Failed to terminate process ${pid}:`});
     return 'failed';
+  }
+
+  /** Lines since process start, evicted ones included */
+  private static totalLineCount(session: OutputBuffer): number {
+    const lines = session.outputLines;
+    const retained = lines.length > 0 && lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
+    return session.evictedLines + retained;
+  }
+
+  /**
+   * Keep at most MAX_COMPLETED_SESSIONS completed sessions. The one dropped is
+   * the oldest whose output was read in full, else the oldest. A small record
+   * of it is kept (up to MAX_EVICTED_TOMBSTONES), so a later read can say the
+   * process exited and its output is gone instead of "no session".
+   */
+  private retireCompletedSessions(): void {
+    while (this.completedSessions.size > MAX_COMPLETED_SESSIONS) {
+      let victim: number | undefined;
+      for (const [pid, completed] of this.completedSessions) {
+        if (completed.session.readComplete) { victim = pid; break; }
+      }
+      if (victim === undefined) victim = this.completedSessions.keys().next().value as number;
+      const completed = this.completedSessions.get(victim)!;
+      this.completedSessions.delete(victim);
+      this.evictedSessions.set(victim, {
+        pid: victim,
+        exitCode: completed.exitCode,
+        signal: completed.signal,
+        endTime: completed.endTime,
+        totalLines: TerminalManager.totalLineCount(completed.session),
+        readComplete: completed.session.readComplete
+      });
+      while (this.evictedSessions.size > MAX_EVICTED_TOMBSTONES) {
+        this.evictedSessions.delete(this.evictedSessions.keys().next().value as number);
+      }
+    }
+  }
+
+  /** The record of a completed session the cap dropped, if any */
+  getEvictedSession(pid: number): EvictedSession | undefined {
+    return this.evictedSessions.get(pid);
+  }
+
+  /** Whether the process exited but its output is not complete yet (see DrainState) */
+  isDraining(pid: number): boolean {
+    const completed = this.completedSessions.get(pid);
+    return Boolean(completed && completed.session.drain && completed.session.drain.finalizedAt === undefined);
+  }
+
+  /** Folders read_process_output scans for files the process changed */
+  setWatchPaths(pid: number, paths: string[]): void {
+    const session = this.sessions.get(pid) ?? this.completedSessions.get(pid)?.session;
+    if (session) session.watchPaths = paths;
+  }
+
+  /**
+   * Count a read: returns how many reads in a row (this one included)
+   * returned no lines; a read that returned lines resets it to 0.
+   */
+  noteRead(pid: number, returnedLines: number): number {
+    const session = this.sessions.get(pid) ?? this.completedSessions.get(pid)?.session;
+    if (!session) return 0;
+    session.emptyReads = returnedLines > 0 ? 0 : session.emptyReads + 1;
+    return session.emptyReads;
+  }
+
+  /** The facts read_process_output's status block reports */
+  getStatusInfo(pid: number, now: number = Date.now()): ProcessStatusInfo | null {
+    const active = this.sessions.get(pid);
+    const completed = active ? undefined : this.completedSessions.get(pid);
+    const session = active ?? completed?.session;
+    if (!session) return null;
+    const drain = session.drain;
+    let state: ProcessLifecycleState;
+    if (active) {
+      state = this.getProcessState(pid)?.isWaitingForInput ? 'waiting_input' : 'running';
+    } else {
+      state = drain && drain.finalizedAt === undefined ? 'draining' : 'exited';
+    }
+    const total = TerminalManager.totalLineCount(session);
+    const endMs = completed ? completed.endTime.getTime() : now;
+    return {
+      pid,
+      state,
+      shell: session.shell,
+      startTime: session.startTime.getTime(),
+      runtimeMs: endMs - session.startTime.getTime(),
+      sinceLastOutputMs: session.lastOutputAt === undefined ? null : now - session.lastOutputAt,
+      exitCode: completed?.exitCode,
+      signal: completed?.signal,
+      totalLines: total,
+      stdoutLines: session.newlines?.stdout ?? 0,
+      stderrLines: session.newlines?.stderr ?? 0,
+      outputIntegrity: drain?.finalizedAt !== undefined ? (drain.forced ? 'forced_close' : 'complete') : undefined,
+      lateLines: drain?.linesAtFinalize !== undefined ? Math.max(0, total - drain.linesAtFinalize) : 0,
+      emptyReads: session.emptyReads ?? 0,
+      cwd: session.cwd,
+      watchPaths: session.watchPaths
+    };
   }
 
   listActiveSessions(): ActiveSession[] {
