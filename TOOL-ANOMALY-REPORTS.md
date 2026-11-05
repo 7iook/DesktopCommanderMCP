@@ -147,3 +147,15 @@
 - **陷阱(实施中实测踩到)**: 必须**先定编码再量尾巴**。`CE DE`(GBK「无」)里 0xDE 是完成字符的尾字节,在 UTF-8 里却是等待续字节的首字节;先量后猜会把完整 GBK 文本判成截断并从中间切开(该 bug 被 `split GBK reassembles` 断言抓到,当时得 3 字符而非 2)。修正后按「整体是合法 UTF-8?→ 去掉短尾后是否合法且尾部为合法 UTF-8 前缀?→ 否则按 DBCS 从头走 lead/trail 配对」三级判定。
 - **回归测试**: `test-clixml-error-recovery.js` 的解码组(GBK→中文、真 UTF-8 不被破坏、逐字节切分重组、DBCS 切分重组、`incompleteTailLength` 边界);`test-ps-cjk-and-redcheck.js` 端到端验证中文报错可读、中文 stdout 无回归、40 行跨 chunk CJK 无 U+FFFD。
 - **状态**: fixed(2026-08-04)。**遗留**:cmd.exe 的 CJK 仍受「命令行按 OEM 解析」限制(源码注释所述),本次只修读取侧解码;需要可靠 CJK 仍建议用 pwsh。
+
+### A-010: read_process_output 未累计整棵进程树的空闲时间，持续建议等待
+- 日期 / 报告者: 2026-11-06 / WP-M executor
+- 工具: read_process_output
+- 环境: Windows + PowerShell 7 + Node v22.20.0
+- 现象: 长命令连续无输出、树 CPU 接近零、受监视文件无写入时，仍反复提示继续等待；原实例为 pytest-xdist 控制器死锁后轮询约 9 分钟。
+- 复现: `node test/repro/test-process-quiet-realtime.js`，并行启动静默定时器与 CPU 忙循环，连续五次按 50 秒上限读取。
+- 根因: 只保留最近两次 CPU 读数与最后输出时间，没有跨读取累计的会话活动标记；提示仅按空读次数/单次等待上限选择。
+- 修复: 会话记录单调前进的输出、已知 CPU 活动和文件 mtime；60 秒后报告 quiet_for 与观测范围，180 秒后提示调查树外等待或挂起；未知/失败 CPU 样本不累计空闲。
+- 验证: build、test-process-read-status 与标准定向 runner 通过；真实空闲树 quiet_for 为 1.6m、2.5m、3.3m、4.1m，忙树五读均无 quiet_for；退出/排空/强制关闭回归保持通过。
+- 自动检测覆盖? unverified：当前会话未提供 get_recent_anomalies 工具。
+- 状态: fixed(12881fc25938fffe29003f8e045d022be2ac1f81)
