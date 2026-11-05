@@ -357,6 +357,24 @@ async function quietStatus() {
     observeQuiet(activity, last, { ...sample(start + 200000, 0), error: 'unavailable' }, start, undefined);
     assert.equal(activity.quietSince, undefined, 'failed samples break quiet evidence');
     assert.equal(observeQuiet(activity, sample(start + 200000, 0), sample(start + 270000, 0), start, undefined), 70000, 'failed interval is not counted');
+    const child = (pid, cpuMs) => ({ pid, ppid: 987654, name: 'compiler', cpuMs });
+    for (const [scenario, beforeChildren, afterChildren] of [
+      ['departed child with known CPU', [child(2, 9000)], []],
+      ['departed child with unknown CPU', [child(2, null)], []],
+      ['new child with tiny CPU', [], [child(2, 1)]],
+      ['same-size child replacement', [child(2, 0)], [child(3, 0)]],
+    ]) {
+      const before = sample(start, 0), after = sample(start + 190000, 0);
+      before.processes.push(...beforeChildren);
+      after.processes.push(...afterChildren);
+      const mark = { lastActivityAt: start, quietSince: start, samples: 3 };
+      assert.equal(observeQuiet(mark, before, after, start, undefined), undefined, `${scenario} must not count as quiet`);
+      assert.equal(mark.lastActivityAt, after.at, `${scenario} advances activity`);
+      assert.equal(mark.quietSince, undefined, `${scenario} resets quiet`);
+      assert.equal(mark.samples, 0, `${scenario} resets sample count`);
+      assert.equal(observeQuiet(mark, after, { ...after, at: after.at + 61000 }, start, undefined), 61000, `${scenario}: subsequent steady idle tree is quiet`);
+    }
+    console.log('✓ departed known/unknown children, new child and same-size replacement reset quiet; steady idle resumes');
     console.log('✓ quiet grows; busy CPU/output reset; unknown CPU suppresses; 180s hint switches');
   } finally { treeSampler.latest = original; }
 }

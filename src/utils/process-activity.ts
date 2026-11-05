@@ -157,7 +157,8 @@ export function observeQuiet(activity: QuietActivity, previous: TreeSample | und
   if (activity.sampledAt !== last.at) {
     const before = new Map(previous.processes.map(proc => [proc.pid, proc.cpuMs]));
     let delta = 0;
-    let known = last.processes.length > 0 && previous.processes.length > 0;
+    // Departed children may have worked between samples; new PIDs are rejected below.
+    let known = last.processes.length > 0 && last.processes.length === before.size;
     for (const proc of last.processes) {
       const was = before.get(proc.pid);
       if (proc.cpuMs === null || was === null || was === undefined || proc.cpuMs < was) known = false;
