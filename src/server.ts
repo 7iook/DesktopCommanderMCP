@@ -1256,6 +1256,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         wait: requested/actual ms, capped=true when the per-call limit (not timeout_ms) ended the wait;
                         lines: this read, total, per stream, empty reads in a row; output integrity once exited;
                         tree / files: clues when nothing was returned (changed files are candidates, not proof);
+                        quiet_for: observed silence >=60s across output and known tree CPU samples, with file-watch coverage; >=180s suggests investigating external waits or a hang;
                         [hint]: what to do next. A process may print only when it finishes: after repeated empty
                         reads, check the listed files or pass wait_until="exit" instead of polling again.
                         - 'wait_until': "output" (default) or "exit" (wait for the exit, ignoring output)

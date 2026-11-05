@@ -111,10 +111,9 @@ class TreeSampler {
     if (!entry.inflight) {
       entry.inflight = sampleProcessTree(pid).then((sample) => {
         entry.inflight = undefined;
-        if (!sample.error) {
-          entry.previous = entry.last;
-          entry.last = sample;
-        }
+        // Keep failed samples too: an old successful pair is not current quiet evidence.
+        entry.previous = entry.last;
+        entry.last = sample;
         return sample;
       });
     }
@@ -134,6 +133,50 @@ class TreeSampler {
 
 export const treeSampler = new TreeSampler();
 
+/** Fraction of one CPU core that counts as observed activity. */
+export const TREE_ACTIVITY_CPU_RATIO = 0.02;
+
+export interface QuietActivity {
+  lastActivityAt: number;
+  sampledAt?: number;
+  quietSince?: number;
+  samples: number;
+}
+
+/** Advance session activity using completed observations only, never wall-clock silence alone. */
+export function observeQuiet(activity: QuietActivity, previous: TreeSample | undefined, last: TreeSample | undefined,
+  lastOutputAt: number, scan: FileScanResult | undefined): number | undefined {
+  activity.lastActivityAt = Math.max(activity.lastActivityAt, lastOutputAt,
+    ...((scan?.files ?? []).map(file => file.mtimeMs)));
+  if (!previous || !last || last.at <= previous.at || last.error || previous.error) {
+    activity.quietSince = undefined;
+    activity.samples = 0;
+    if (last) activity.lastActivityAt = Math.max(activity.lastActivityAt, last.at);
+    return undefined;
+  }
+  if (activity.sampledAt !== last.at) {
+    const before = new Map(previous.processes.map(proc => [proc.pid, proc.cpuMs]));
+    let delta = 0;
+    let known = last.processes.length > 0 && previous.processes.length > 0;
+    for (const proc of last.processes) {
+      const was = before.get(proc.pid);
+      if (proc.cpuMs === null || was === null || was === undefined || proc.cpuMs < was) known = false;
+      else delta += proc.cpuMs - was;
+    }
+    activity.sampledAt = last.at;
+    if (!known || delta >= (last.at - previous.at) * TREE_ACTIVITY_CPU_RATIO) {
+      activity.lastActivityAt = Math.max(activity.lastActivityAt, last.at);
+      activity.quietSince = undefined;
+      activity.samples = 0;
+      return undefined;
+    }
+    activity.quietSince ??= previous.at;
+    activity.samples++;
+  }
+  if (activity.quietSince === undefined) return undefined;
+  return Math.max(0, last.at - Math.max(activity.quietSince, activity.lastActivityAt));
+}
+
 function totalCpu(sample: TreeSample): number | null {
   let total = 0;
   for (const proc of sample.processes) {
@@ -150,6 +193,7 @@ function totalCpu(sample: TreeSample): number | null {
  */
 export function formatTreeLine(previous: TreeSample | undefined, last: TreeSample | undefined, pending: boolean, now: number = Date.now()): string {
   if (!last) return pending ? 'tree: sampling (first sample not ready yet)' : 'tree: unavailable';
+  if (last.error) return 'tree: unavailable (sample failed; CPU unknown)';
   if (last.processes.length === 0) return 'tree: root process not found (it may have just exited)';
   const shown = last.processes.slice(0, 6).map((proc) => `${proc.name} ${proc.pid}`).join(', ');
   const more = last.processes.length > 6 ? `, +${last.processes.length - 6} more` : '';
@@ -161,7 +205,7 @@ export function formatTreeLine(previous: TreeSample | undefined, last: TreeSampl
     for (const proc of last.processes) {
       const was = before.get(proc.pid);
       if (proc.cpuMs === null || was === null) { known = false; break; }
-      delta += proc.cpuMs - (was ?? 0);
+      if (was !== undefined) delta += proc.cpuMs - was;
     }
     const span = ((last.at - previous.at) / 1000).toFixed(1);
     cpu = known ? `cpu_delta=+${(Math.max(0, delta) / 1000).toFixed(2)}s over ${span}s` : 'cpu=unknown';

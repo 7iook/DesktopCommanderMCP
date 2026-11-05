@@ -89,6 +89,7 @@ function newStreamTails(): StreamTails {
 interface ManagedSession extends TerminalSession {
   streams: StreamTails;
   lastOutputAt?: number;                          // When the latest chunk arrived (ms epoch)
+  quietActivity?: import('./utils/process-activity.js').QuietActivity;
   newlines: Record<OutputStream, number>;         // Line breaks each stream delivered (its line count)
   emptyReads: number;                             // read_process_output calls in a row that returned no lines
   readComplete: boolean;                          // A default read has returned all output after the exit
@@ -148,6 +149,8 @@ export interface ProcessStatusInfo {
   startTime: number;
   runtimeMs: number;
   sinceLastOutputMs: number | null;   // null: no output yet
+  lastOutputAt?: number;
+  quietActivity: import('./utils/process-activity.js').QuietActivity;
   exitCode: number | null | undefined;
   signal: NodeJS.Signals | null | undefined;
   totalLines: number;
@@ -687,6 +690,7 @@ export class TerminalManager {
     if (!text) return;
     this.appendToLineBuffer(session, text);
     session.lastOutputAt = Date.now();
+    if (session.quietActivity) session.quietActivity.lastActivityAt = Math.max(session.quietActivity.lastActivityAt, session.lastOutputAt);
     if (session.newlines) {
       let breaks = 0;
       for (let i = text.indexOf('\n'); i !== -1; i = text.indexOf('\n', i + 1)) breaks++;
@@ -1309,6 +1313,8 @@ export class TerminalManager {
       runtimeMs: endMs - session.startTime.getTime(),
       // Up to the exit for an exited process: time after it says nothing about the process
       sinceLastOutputMs: session.lastOutputAt === undefined ? null : Math.max(0, Math.min(now, endMs) - session.lastOutputAt),
+      lastOutputAt: session.lastOutputAt,
+      quietActivity: session.quietActivity ??= { lastActivityAt: session.startTime.getTime(), samples: 0 },
       exitCode: completed?.exitCode,
       signal: completed?.signal,
       totalLines: total,

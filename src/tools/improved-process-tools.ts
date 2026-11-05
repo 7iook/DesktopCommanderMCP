@@ -1,5 +1,5 @@
 import { terminalManager, MAX_BUFFERED_OUTPUT_CHARS, getProcessWaitLimit, EXIT_CLOSE_GRACE_MS, type ProcessStatusInfo } from '../terminal-manager.js';
-import { treeSampler, formatTreeLine, scanChangedFiles, formatFileLines, type FileScanResult } from '../utils/process-activity.js';
+import { treeSampler, formatTreeLine, scanChangedFiles, formatFileLines, observeQuiet, type FileScanResult } from '../utils/process-activity.js';
 import { commandManager } from '../command-manager.js';
 import { StartProcessArgsSchema, ReadProcessOutputArgsSchema, InteractWithProcessArgsSchema, InteractWithProcessLinesArgsSchema, ForceTerminateArgsSchema, ListSessionsArgsSchema } from './schemas.js';
 import { capture } from "../utils/capture.js";
@@ -597,7 +597,7 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
   // Start sampling the process tree now, so the sample (slow on Windows)
   // runs during the wait instead of after it
   if (session) {
-    treeSampler.start(session.pid).catch(() => undefined);
+    startTreeObservation(session.pid);
   }
 
   // tail -f follow for absolute/tail reads (offset !== 0). This waits for NEW
@@ -665,7 +665,7 @@ export async function readProcessOutput(args: unknown, maxWaitMs: number = MAX_P
         // time a long wait ends: take another shortly before it ends
         if (session && effectiveWaitMs > TREE_RESAMPLE_LEAD_MS * 2) {
           resample = setTimeout(() => {
-            treeSampler.start(session.pid).catch(() => undefined);
+            startTreeObservation(session.pid);
           }, effectiveWaitMs - TREE_RESAMPLE_LEAD_MS);
         }
 
@@ -846,6 +846,16 @@ const TREE_RESAMPLE_LEAD_MS = 2000;
 /** Part of it the file scan may use; the tree sample runs alongside */
 const FILE_SCAN_BUDGET_MS = 150;
 
+/** Account for every completed pair, including the sample at the beginning of a read. */
+function startTreeObservation(pid: number): void {
+  void treeSampler.start(pid).then(() => {
+    const info = terminalManager.getStatusInfo(pid);
+    if (!info || (info.state !== 'running' && info.state !== 'waiting_input')) return;
+    const latest = treeSampler.latest(pid);
+    observeQuiet(info.quietActivity, latest.previous, latest.last, info.lastOutputAt ?? info.startTime, undefined);
+  });
+}
+
 interface ReadFacts {
   requestedMs: number;
   waitedMs: number;
@@ -884,6 +894,7 @@ export async function buildStatusBlock(info: ProcessStatusInfo, read: ReadFacts)
 
   // Clues: only when they can explain silence (nothing returned, or the process ended)
   const wantClues = read.thisRead === 0 || !alive;
+  let quietMs: number | undefined;
   if (wantClues) {
     const scanDeadline = observeStart + FILE_SCAN_BUDGET_MS;
     const watched = Boolean(info.watchPaths && info.watchPaths.length > 0);
@@ -905,6 +916,13 @@ export async function buildStatusBlock(info: ProcessStatusInfo, read: ReadFacts)
       treeSampler.forget(info.pid);
     }
     const scan = await scanPromise;
+    if (alive) {
+      const latest = treeSampler.latest(info.pid);
+      quietMs = observeQuiet(info.quietActivity, latest.previous, latest.last, info.lastOutputAt ?? info.startTime, scan);
+      if (quietMs !== undefined && quietMs >= 60000) {
+        lines.push(`  quiet_for=${(quietMs / 60000).toFixed(1)}m (no output, tree cpu ~0; based on ${info.quietActivity.samples} sample pairs; ${watched && scan ? `no observed watched-file writes${scan.partial ? ' (partial scan)' : ' (bounded scan)'}` : 'watched-file writes unobserved'})`);
+      }
+    }
     if (treeLine) lines.push(`  ${treeLine}`);
     for (const fileLine of formatFileLines(scan, watched)) lines.push(`  ${fileLine}`);
   }
@@ -912,7 +930,10 @@ export async function buildStatusBlock(info: ProcessStatusInfo, read: ReadFacts)
   const hints: string[] = [];
   const untilExit = read.waitUntil === 'exit';
   const keepsPollingEmpty = alive && read.thisRead === 0 && read.emptyReads >= 2 && !untilExit;
-  if (read.capped && untilExit) {
+  const longQuiet = quietMs !== undefined && quietMs >= 180000;
+  if (longQuiet) {
+    hints.push(`The whole tree has done nothing observable for ${(quietMs! / 60000).toFixed(1)}m within the sampled signals above. Either it is waiting on something outside the tree (a network service, CI, another process, or a user), or it is hung. If no external wait is expected, stop polling and find what it waits on: list its process tree; for Python use py-spy dump --pid <pid>; for files use a handle tool; or force_terminate(pid=${info.pid}).`);
+  } else if (read.capped && untilExit) {
     // Already waiting for the exit: calling the same again is the right next step
     hints.push(`This wait stopped at the per-call limit (${read.capMs}ms), not at timeout_ms=${read.requestedMs}; the process keeps running. Call read_process_output(pid=${info.pid}, wait_until="exit") again to keep waiting for the exit; use force_terminate only if the run clearly exceeds its expected duration.`);
   } else if (read.capped) {
@@ -921,7 +942,7 @@ export async function buildStatusBlock(info: ProcessStatusInfo, read: ReadFacts)
       ? `This wait stopped at the per-call limit (${read.capMs}ms), not at timeout_ms=${read.requestedMs}; the process keeps running.`
       : `This wait stopped at the per-call limit (${read.capMs}ms), not at timeout_ms=${read.requestedMs}; the process keeps running. Call read_process_output again to keep waiting.`);
   }
-  if (untilExit) {
+  if (longQuiet || untilExit) {
     // The empty-read hints below would only suggest the wait_until="exit" this read already used
   } else if (alive && read.thisRead === 0 && read.emptyReads === 2) {
     hints.push(`No new output for 2 reads in a row. The process may print only when it finishes (e.g. it captures a child's output, or buffers it). Look at the tree/files lines above, or call read_process_output(pid=${info.pid}, wait_until="exit") to wait for the exit instead of for output.`);

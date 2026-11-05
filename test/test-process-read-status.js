@@ -10,9 +10,9 @@ import assert from 'assert';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { startProcess, readProcessOutput, forceTerminate } from '../dist/tools/improved-process-tools.js';
+import { startProcess, readProcessOutput, forceTerminate, buildStatusBlock } from '../dist/tools/improved-process-tools.js';
 import { TerminalManager, MAX_COMPLETED_SESSIONS, MAX_EVICTED_TOMBSTONES, setLateOutputWindowMsForTests } from '../dist/terminal-manager.js';
-import { parsePsTime, descendantsOf, formatTreeLine, scanChangedFiles } from '../dist/utils/process-activity.js';
+import { parsePsTime, descendantsOf, formatTreeLine, scanChangedFiles, treeSampler, observeQuiet } from '../dist/utils/process-activity.js';
 import { spawnSync } from 'child_process';
 import { runIfMain, skip } from './helpers/run-if-main.js';
 
@@ -167,6 +167,7 @@ async function exitedFilesAndCappedExitWait(dir) {
   const sub = path.join(dir, 'files-until-exit');
   fs.mkdirSync(sub);
   const quick = await start('node -e "require(\'fs\').writeFileSync(\'mine.txt\',\'m\')"', sub);
+  await readProcessOutput({ pid: quick, wait_until: 'exit', timeout_ms: 5000 }, 5000);
   await sleep(1500);
   fs.writeFileSync(path.join(sub, 'other.txt'), 'o');
   const text = textOf(await readProcessOutput({ pid: quick, offset: -1 }, 100));
@@ -297,6 +298,7 @@ async function helpers(dir) {
 }
 
 export default async function runTests() {
+  await quietStatus();
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dc-read-status-')));
   try {
     await helpers(dir);
@@ -319,3 +321,42 @@ export default async function runTests() {
 }
 
 runIfMain(import.meta.url, runTests);
+
+async function quietStatus() {
+  const manager = new TerminalManager();
+  const pid = 987654;
+  const start = Date.now() - 400000;
+  manager.sessions.set(pid, { pid, outputLines: [''], evictedLines: 0, streams: { stdout: { text: '', chars: 0, turn: 0 }, stderr: { text: '', chars: 0, turn: 0 } }, startTime: new Date(start), cwd: '', newlines: {} });
+  const sample = (at, cpuMs) => ({ at, rootPid: pid, processes: [{ pid, ppid: 0, name: 'idle', cpuMs }] });
+  let previous = sample(start, 0), last = sample(start + 61000, 0);
+  const original = treeSampler.latest;
+  treeSampler.latest = () => ({ previous, last, pending: false });
+  const read = { requestedMs: 50000, waitedMs: 50000, capMs: 50000, capped: true, reason: 'timeout', thisRead: 0, emptyReads: 4, waitUntil: 'exit' };
+  const render = () => buildStatusBlock(manager.getStatusInfo(pid), read);
+  try {
+    assert.match(await render(), /quiet_for=1\.0m/);
+    previous = last; last = sample(start + 179999, 0);
+    assert((await render()).includes('again to keep waiting'), 'old hint remains below 180 seconds');
+    previous = last; last = sample(start + 180000, 0);
+    let text = await render();
+    assert.match(text, /quiet_for=3\.0m/);
+    assert.match(text, /outside the tree[\s\S]*py-spy dump --pid/);
+    assert(!text.includes('again to keep waiting'));
+    previous = last; last = sample(start + 250000, 2000);
+    assert(!(await render()).includes('quiet_for='), 'busy CPU resets quiet');
+    previous = last; last = sample(start + 320000, 2000);
+    assert.match(await render(), /quiet_for=1\.2m/);
+    manager.sessions.get(pid).lastOutputAt = start + 310000;
+    assert(!(await render()).includes('quiet_for='), 'new output resets quiet');
+    previous = last; last = sample(start + 390000, null);
+    assert(!(await render()).includes('quiet_for='), 'unknown CPU is not quiet evidence');
+    const activity = { lastActivityAt: start, samples: 0 };
+    previous = sample(start, 0); last = sample(start + 190000, 0);
+    assert.equal(observeQuiet(activity, previous, last, start, undefined), 190000);
+    assert.equal(observeQuiet(activity, previous, last, start, { files: [{ path: 'result.txt', size: 1, mtimeMs: start + 180000 }], partial: false, scannedEntries: 1 }), 10000, 'file writes reset quiet');
+    observeQuiet(activity, last, { ...sample(start + 200000, 0), error: 'unavailable' }, start, undefined);
+    assert.equal(activity.quietSince, undefined, 'failed samples break quiet evidence');
+    assert.equal(observeQuiet(activity, sample(start + 200000, 0), sample(start + 270000, 0), start, undefined), 70000, 'failed interval is not counted');
+    console.log('✓ quiet grows; busy CPU/output reset; unknown CPU suppresses; 180s hint switches');
+  } finally { treeSampler.latest = original; }
+}
