@@ -4,39 +4,10 @@ import { DEFAULT_COMMAND_TIMEOUT, MAX_PROCESS_WAIT_MS } from './config.js';
 import { configManager, type ServerConfig } from './config-manager.js';
 import {capture} from "./utils/capture.js";
 import { analyzeProcessState, STATE_DETECTION_TAIL_CHARS, type ProcessState } from './utils/process-detection.js';
-import { getDefaultShell, getShellSpawnArgs, type ShellSpawnConfig } from './utils/shell.js';
+import { getCommandShell, getShellEnvironment, getShellSpawnArgs, type ShellSpawnConfig } from './utils/shell.js';
 import { terminateProcessTree } from './utils/process-tree.js';
 import { markHotPathEnter, markHotPathExit } from './utils/main-thread-watchdog.js';
 import { ShellByteDecoder, extractClixmlRecords } from './utils/clixml.js';
-
-/**
- * Standard Windows PATHEXT value, used to repair a corrupted PATHEXT before
- * spawning child shells.
- *
- * On some Windows Claude Desktop / DXT launches the server process inherits a
- * broken PATHEXT (observed as ".CPL" only). Because we build the child env from
- * { ...process.env }, that broken value would propagate into every spawned
- * shell, stripping ".EXE" and breaking resolution of git / node / python / rg /
- * etc. (and even full-path .exe invocations under PowerShell). See issue #481.
- */
-const STANDARD_PATHEXT = '.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC';
-
-/**
- * Return a healthy PATHEXT for spawned Windows shells.
- * - Unset           -> use the standard list.
- * - Missing ".EXE"  -> corrupted; merge the standard list with whatever was
- *                      present (preserves any extra extensions, order-stable).
- * - Otherwise       -> leave the inherited value untouched.
- */
-function getRepairedPathExt(): string {
-  const current = process.env.PATHEXT;
-  if (!current) return STANDARD_PATHEXT;
-  const exts = current.split(';').map(e => e.trim().toUpperCase()).filter(Boolean);
-  if (!exts.includes('.EXE')) {
-    return [...new Set([...STANDARD_PATHEXT.split(';'), ...exts])].join(';');
-  }
-  return current;
-}
 
 /**
  * Recover real text from PowerShell CLIXML envelopes and drop only the noise.
@@ -295,7 +266,7 @@ export class TerminalManager {
       // If there's an error getting the config, fall back to the default shell
     }
     // Get the shell from config if not specified
-    const shellToUse = shell || config.defaultShell || getDefaultShell();
+    const shellToUse = getCommandShell(shell, config.defaultShell);
     // UTF-8 prefix / -OutputFormat Text / CLIXML recovery for PowerShell (opt out via config)
     const patchEncoding = config.disableShellEncodingPatching !== true;
     const waitLimit = getProcessWaitLimit(timeoutMs, maxWaitMs);
@@ -312,10 +283,8 @@ export class TerminalManager {
     // Get the appropriate spawn configuration for the shell, with login flags where appropriate
     const spawnConfig: ShellSpawnConfig = getShellSpawnArgs(shellToUse, enhancedCommand, patchEncoding);
     const spawnOptions: any = {
-      env: {
-        ...process.env,
-        TERM: 'xterm-256color'  // Better terminal compatibility
-      },
+      // PATHEXT and ProgramData repaired on Windows; TERM for better terminal compatibility.
+      env: getShellEnvironment(),
       windowsHide: true  // Prevent visible console windows on Windows
     };
 
@@ -343,14 +312,6 @@ export class TerminalManager {
       const has = (name: string) => Object.keys(spawnOptions.env).some((key) => key.toUpperCase() === name);
       if (!has('PYTHONUNBUFFERED')) spawnOptions.env.PYTHONUNBUFFERED = '1';
       if (!has('PYTHONIOENCODING')) spawnOptions.env.PYTHONIOENCODING = 'utf-8';
-    }
-
-    // Repair PATHEXT on Windows before spawning. On some Windows DXT launches
-    // the server process inherits a corrupted PATHEXT (e.g. ".CPL"), which we
-    // would otherwise propagate via { ...process.env } and break command
-    // resolution (git, node, python, rg, ...) in the spawned shell. See #481.
-    if (process.platform === 'win32' && spawnOptions.env) {
-      spawnOptions.env.PATHEXT = getRepairedPathExt();
     }
 
     // On Windows, when we invoke cmd.exe directly and pass the user's command as a

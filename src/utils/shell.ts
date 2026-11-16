@@ -82,6 +82,67 @@ export function resolveProgramPath(program: string): string {
 }
 
 /**
+ * Standard Windows PATHEXT value, used to repair a corrupted PATHEXT before
+ * running a command.
+ *
+ * On some Windows Claude Desktop / DXT launches the server process inherits a
+ * broken PATHEXT (observed as ".CPL" only). Because commands get the server's
+ * environment, that broken value would propagate into every spawned shell,
+ * stripping ".EXE" and breaking resolution of git / node / python / rg / etc.
+ * (and even full-path .exe invocations under PowerShell). See issue #481.
+ */
+const STANDARD_PATHEXT = '.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC';
+
+/**
+ * Return a healthy PATHEXT for spawned Windows shells.
+ * - Unset           -> use the standard list.
+ * - Missing ".EXE"  -> corrupted; merge the standard list with whatever was
+ *                      present (preserves any extra extensions, order-stable).
+ * - Otherwise       -> leave the inherited value untouched.
+ */
+function getRepairedPathExt(): string {
+  const current = process.env.PATHEXT;
+  if (!current) return STANDARD_PATHEXT;
+  const exts = current.split(';').map(e => e.trim().toUpperCase()).filter(Boolean);
+  if (!exts.includes('.EXE')) {
+    return [...new Set([...STANDARD_PATHEXT.split(';'), ...exts])].join(';');
+  }
+  return current;
+}
+
+/**
+ * The environment for what Desktop Commander runs for the AI (start_process
+ * commands, node:local code): the server's own, with on Windows what a
+ * client's launch broke or left out put back. PATHEXT is repaired (#481).
+ * ProgramData is set when missing: a client on the MCP SDK's default
+ * environment leaves it out, and Windows OpenSSH (ssh, scp, sftp, ssh-keygen)
+ * exits 255 without a word when it's unset (#702). Windows keeps it on the
+ * system drive, which the SDK's set does pass (SystemDrive, else SystemRoot's
+ * drive); with neither it stays unset.
+ */
+export function getCommandEnvironment(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  if (isWindows()) {
+    env.PATHEXT = getRepairedPathExt();
+    // process.env ignores the name's case on Windows; the copy doesn't, so it's read here
+    const drive = process.env.SystemDrive || path.win32.parse(process.env.SystemRoot ?? '').root;
+    if (!process.env.ProgramData && drive) {
+      env.ProgramData = path.win32.join(drive, '\\', 'ProgramData');
+    }
+  }
+  return env;
+}
+
+/**
+ * The environment of the shell start_process runs a command in: the
+ * command environment, with TERM for better terminal compatibility. The
+ * PowerShell helper starts with it too, so the user's profile sees the same.
+ */
+export function getShellEnvironment(): NodeJS.ProcessEnv {
+  return { ...getCommandEnvironment(), TERM: 'xterm-256color' };
+}
+
+/**
  * The shell used when the user hasn't configured one.
  * Windows: Windows PowerShell, falling back to %ComSpec%.
  * macOS/Linux: $SHELL, falling back to the OS default shell.
@@ -137,6 +198,77 @@ export function detectAvailableShells(): string[] {
     readEtcShells().forEach(add);
   }
   return [...shells];
+}
+
+// WSL's entry in binfmt_misc that lets Linux run Windows programs. Distros that run systemd get it late, under the second name
+const WSL_INTEROP_ENTRIES = ['/proc/sys/fs/binfmt_misc/WSLInterop', '/proc/sys/fs/binfmt_misc/WSLInterop-late'];
+let wslInterop = false; // true once the entry was found
+
+/**
+ * Whether this is WSL, which runs Windows programs from Linux. WSL sets
+ * WSL_DISTRO_NAME for what it starts. What runs without it, through sudo
+ * (which clears the environment) or as a service, is known by WSL's interop
+ * entry. Once found it is remembered; while missing it is looked for again,
+ * since WSL can register it again after it was gone. A Docker container on
+ * WSL's kernel has no such entry and can't run Windows programs.
+ */
+function isWsl(): boolean {
+  if (process.env.WSL_DISTRO_NAME) return true;
+  wslInterop ||= WSL_INTEROP_ENTRIES.some((entry) => fs.existsSync(entry));
+  return wslInterop;
+}
+
+/**
+ * A program's name without its folder or extension, lowercased:
+ * C:\Windows\System32\NET.EXE is "net". The folder goes as Windows writes it
+ * (\ or /, or a drive, as in C:sc.exe). POSIX shells outside Windows use
+ * only / as a folder separator. PowerShell also removes .ps1; on Windows
+ * and WSL the extensions in the repaired PATHEXT are removed as commands run
+ * with them. WSL runs Windows programs from Linux
+ * (sc.exe stop Spooler), so there too. The command check compares the names it
+ * finds and the blockedCommands entries in this form. POSIX shells on
+ * Windows still accept Windows paths, as Git Bash does.
+ * Without a shell type, retain the historical PowerShell-style normalization.
+ */
+export function programName(name: string, shellType: ShellType = 'powershell'): string {
+  const paths = shellType === 'posix' && !isWindows() ? path.posix : path.win32;
+  const program = paths.basename(name).toLowerCase();
+  const extensions = [
+    ...(shellType === 'powershell' ? ['.ps1'] : []),
+    ...(isWindows() || isWsl() ? getRepairedPathExt().split(';') : []),
+  ]
+    .map((ext) => ext.trim().toLowerCase());
+  const extension = paths.extname(program);
+  return extension && extensions.includes(extension) ? program.slice(0, -extension.length) : program;
+}
+
+/** The kinds of shell a command can run in. The command check has a reader for each. */
+export type ShellType = 'posix' | 'powershell' | 'cmd';
+
+/**
+ * Which kind of shell a shell program is, by its name without folder and
+ * lowercased, as getShellSpawnArgs() reads it: pwsh and powershell (with or
+ * without .exe) are PowerShell, cmd and cmd.exe are cmd, and every other shell
+ * (bash, zsh, sh, dash, ksh, fish) is POSIX. getShellSpawnArgs() starts each
+ * kind its own way.
+ */
+export function getShellType(shell: string): ShellType {
+  const name = path.basename(shell).toLowerCase();
+  if (['pwsh', 'pwsh.exe', 'powershell', 'powershell.exe'].includes(name)) return 'powershell';
+  if (name === 'cmd' || name === 'cmd.exe') return 'cmd';
+  return 'posix';
+}
+
+/** The POSIX shells (and fish) by programName(): each runs a script file it's given (bash deploy.sh) */
+export const POSIX_SHELLS = new Set(['bash', 'sh', 'dash', 'zsh', 'ksh', 'ksh93', 'mksh', 'ash', 'fish']);
+
+/**
+ * The shell start_process runs a command in: the one asked for, else the
+ * defaultShell setting, else this machine's default. The command check reads
+ * the command with the same shell.
+ */
+export function getCommandShell(shell: string | undefined, defaultShell: string | undefined): string {
+  return shell || defaultShell || getDefaultShell();
 }
 
 /**

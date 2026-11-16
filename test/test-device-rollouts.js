@@ -137,11 +137,11 @@ async function checkRule(rule) {
  * `check(standIn, device)` runs once the device got through its start.
  */
 async function withDevice({ standInOptions, prepare }, check) {
-  const standIn = await startRemoteStandIn(standInOptions);
+  const standIn = await startRemoteStandIn({ ...standInOptions, hostedSupabase: true });
   const testEnv = createTestEnv();
   let device;
   try {
-    writeDeviceConfig(testEnv.home, { deviceId: standIn.deviceId, session: prepare(standIn) });
+    writeDeviceConfig(testEnv.home, { deviceId: standIn.deviceId, session: prepare(standIn), authContext: { serverOrigin: standIn.url, supabaseUrl: standIn.supabaseUrl ?? standIn.url } });
     device = startDevice({ ...testEnv.env, MCP_SERVER_URL: standIn.url });
     await waitFor(device, () => STARTED.test(device.output), START_DEADLINE_MS);
     assert.ok(STARTED.test(device.output),
@@ -241,7 +241,9 @@ async function runTests() {
       rolloutManager.startRefresh();`;
     const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: 'ignore' });
     const exited = await new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(false), 10_000);
+      // It exits in well under a second here; a refresh that keeps it running
+      // keeps it for 30 minutes, so 30 s holds up on a loaded machine and still tells
+      const timer = setTimeout(() => resolve(false), 30_000);
       child.on('exit', () => {
         clearTimeout(timer);
         resolve(true);

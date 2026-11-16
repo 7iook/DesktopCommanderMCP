@@ -15,8 +15,9 @@
 
 import fs from "fs/promises";
 import path from "path";
+import { once } from 'events';
 import { createReadStream } from 'fs';
-import { createInterface } from 'readline';
+import { createInterface, Interface } from 'readline';
 import {
     FileHandler,
     ReadOptions,
@@ -42,33 +43,6 @@ const FILE_SIZE_LIMITS = {
     LARGE_FILE_THRESHOLD: 10 * 1024 * 1024,  // 10MB
     LINE_COUNT_LIMIT: 10 * 1024 * 1024,      // 10MB for line counting
 } as const;
-
-/**
- * Run a readline pass over a file and guarantee the underlying descriptor is
- * released, even when the consumer breaks out of the loop early.
- *
- * `rl.close()` only tears down the readline interface — it does NOT close the
- * input stream. A stream that reached EOF closes itself, which is why full
- * reads never leaked; but every early `break` (line-limit reached, sample size
- * reached) left the fd open until GC. On Windows that fd keeps the file locked,
- * so later deletes and atomic `rename` replacements fail with EPERM/EBUSY.
- *
- * Upstream issues: #476 (locked large files), #502 (locked `.tmp*` files).
- */
-async function withLineReader<T>(
-    filePath: string,
-    streamOptions: { start?: number; signal?: AbortSignal; encoding?: BufferEncoding },
-    consume: (lines: AsyncIterable<string>) => Promise<T>
-): Promise<T> {
-    const stream = createReadStream(filePath, streamOptions);
-    const rl = createInterface({ input: stream, crlfDelay: Infinity });
-    try {
-        return await consume(rl);
-    } finally {
-        rl.close();
-        stream.destroy();
-    }
-}
 
 const READ_PERFORMANCE_THRESHOLDS = {
     SMALL_READ_THRESHOLD: 100,    // For very small reads
@@ -409,6 +383,35 @@ export class TextFileHandler implements FileHandler {
     }
 
     /**
+     * Run `readLines` on a readline over `filePath`, then close the file before
+     * returning, whether the read finished, stopped early or failed. rl.close()
+     * alone closes the line reader, not the file stream under it, so a read
+     * that stopped early kept the file open until the process exited.
+     */
+    private async withLineReader(
+        filePath: string,
+        options: { signal?: AbortSignal; encoding?: BufferEncoding; start?: number },
+        readLines: (rl: Interface) => Promise<void>
+    ): Promise<void> {
+        const input = createReadStream(filePath, options);
+        // Settles once the file is closed: on 'close', or on 'error', which a
+        // file stream emits after closing its file
+        const closed = once(input, 'close').catch(() => {});
+        const rl = createInterface({
+            input,
+            crlfDelay: Infinity
+        });
+
+        try {
+            await readLines(rl);
+        } finally {
+            rl.close();
+            input.destroy();
+            await closed;
+        }
+    }
+
+    /**
      * Read from end using readline with circular buffer
      */
     private async readFromEndWithReadline(
@@ -425,8 +428,8 @@ export class TextFileHandler implements FileHandler {
         let bufferIndex = 0;
         let totalLines = 0;
 
-        await withLineReader(filePath, { signal, encoding, start }, async (lines) => {
-            for await (const line of lines) {
+        await this.withLineReader(filePath, { signal, encoding, start }, async (rl) => {
+            for await (const line of rl) {
                 buffer[bufferIndex] = line;
                 bufferIndex = (bufferIndex + 1) % requestedLines;
                 totalLines++;
@@ -469,8 +472,8 @@ export class TextFileHandler implements FileHandler {
         const result: string[] = [];
         let lineNumber = startLine;
 
-        await withLineReader(filePath, { signal, encoding, start }, async (lines) => {
-            for await (const line of lines) {
+        await this.withLineReader(filePath, { signal, encoding, start }, async (rl) => {
+            for await (const line of rl) {
                 if (lineNumber >= offset && result.length < length) {
                     result.push(line);
                 }

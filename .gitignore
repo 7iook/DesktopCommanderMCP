@@ -62,3 +62,6 @@ test_search.js
 
 # AI agent workspace (RCA / decision cards / scratch — never publish)
 .agent-workspace/
+
+# Test reports: junit.xml, results.json, results.tap per runner (test/README.md)
+test-results/
