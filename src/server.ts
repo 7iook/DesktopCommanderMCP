@@ -481,10 +481,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         - For continuation after a partial write, the existing file state can be inspected before appending the remaining content.
 
                         EXISTING FILES (overwrite protection):
+                        A file that already has content is protected - and that includes a file
+                        you created earlier in this same conversation. To replace its whole
+                        content, pass mode:'rewrite', allowOverwrite:true in the FIRST call;
+                        do not wait for a rejection to add them.
                         - New or empty file: mode may be omitted.
                         - Add to the end of an existing file: mode:'append'.
-                        - Replace an existing file: mode:'rewrite' AND allowOverwrite:true (both, in one call).
+                        - Replace an existing file: mode:'rewrite', allowOverwrite:true (both, in one call).
                         - Change only part of a file: use edit_block instead.
+                        Without those arguments, a write over a non-empty file is rejected
+                        (overwrite protection is on by default), nothing is written, and the
+                        rejection names the arguments to retry with.
 
                         FORMAT HANDLING (by extension):
                         - Text files: String content
@@ -519,7 +526,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         Input: { files: [ { path, content, mode?, allowOverwrite? }, ... ] }
                         - mode: "rewrite" (default) or "append"
                         - allowOverwrite: required to rewrite an existing file (same overwrite
-                          protection as write_file)
+                          protection as write_file). A file created earlier in this conversation
+                          counts as existing: to replace it, set mode:"rewrite" and
+                          allowOverwrite:true on that entry in the first call.
 
                         BEHAVIOR:
                         - Different files are written concurrently; same-path entries are

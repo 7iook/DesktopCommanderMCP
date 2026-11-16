@@ -173,15 +173,24 @@ export const ReadMultipleFilesArgsSchema = z.object({
   paths: z.array(z.string()),
 });
 
+// Shown on the parameters in tools/list, so a caller filling in arguments sees
+// the replace rule before the first call instead of learning it from a rejection.
+const WRITE_MODE_DESCRIPTION =
+  "'rewrite' replaces the file, 'append' adds to its end. Replacing a file that already has content " +
+  "(including one created earlier in this conversation) also needs allowOverwrite:true in the same call.";
+const ALLOW_OVERWRITE_DESCRIPTION =
+  "Set true, together with mode:'rewrite', to replace a file that already has content - including a file " +
+  "created earlier in this conversation. Pass it in the first call; without it that write is rejected and nothing is written.";
+
 export const WriteFileArgsSchema = z.object({
   path: z.string(),
   content: z.string(),
-  mode: z.enum(['rewrite', 'append']).default('rewrite'),
+  mode: z.enum(['rewrite', 'append']).default('rewrite').describe(WRITE_MODE_DESCRIPTION),
   // Overwrite protection: when mode='rewrite' and the target file already
   // exists, the handler refuses unless allowOverwrite is true. Prevents
   // silent full-file overwrites by AI clients that ignore prompt-level rules.
   // Disable globally via config: writeFileOverwriteProtection=false.
-  allowOverwrite: z.boolean().optional().default(false),
+  allowOverwrite: z.boolean().optional().default(false).describe(ALLOW_OVERWRITE_DESCRIPTION),
   // 'ui' when fired by the file-preview UI, else 'llm'. 'ui' calls are
   // excluded from tool-call telemetry; see isUiOriginCall in server.ts.
   origin: z.enum(['ui', 'llm']).optional(),
@@ -198,8 +207,8 @@ export const WriteMultipleFilesArgsSchema = z.object({
   files: z.array(z.object({
     path: z.string(),
     content: z.string(),
-    mode: z.enum(['rewrite', 'append']).optional().default('rewrite'),
-    allowOverwrite: z.boolean().optional().default(false),
+    mode: z.enum(['rewrite', 'append']).optional().default('rewrite').describe(WRITE_MODE_DESCRIPTION),
+    allowOverwrite: z.boolean().optional().default(false).describe(ALLOW_OVERWRITE_DESCRIPTION),
   })).min(1),
 });
 
